@@ -1,3 +1,2 @@
 aiogram
-APScheduler<4
-aiohttp
+APScheduler
