@@ -3,8 +3,11 @@ import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -12,48 +15,58 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 
-# =========================================================
+# =====================================================
 # ⚙️ SOZLAMALAR
-# =========================================================
+# =====================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 TZ = ZoneInfo("Asia/Tashkent")
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML
+    )
+)
+
 dp = Dispatcher()
 
-scheduler = AsyncIOScheduler(timezone=TZ)
+scheduler = AsyncIOScheduler(
+    timezone=TZ
+)
 
 
-# =========================================================
-# 🗂️ VAQTINCHALIK MA'LUMOTLAR
-# =========================================================
+# =====================================================
+# 🗂️ MA'LUMOTLAR
+# =====================================================
 
 # user_id -> kanal
 user_channels = {}
 
-# user_id -> yuborgan post
+# user_id -> post
 user_messages = {}
 
 
-# =========================================================
+# =====================================================
 # 🔐 HOLATLAR
-# =========================================================
+# =====================================================
 
 class SetupState(StatesGroup):
     waiting_channel = State()
     waiting_confirmation = State()
-    waiting_post = State()
     waiting_time = State()
 
 
-# =========================================================
+# =====================================================
 # 🚀 /START
-# =========================================================
+# =====================================================
 
 @dp.message(Command("start"))
-async def start(message: types.Message, state: FSMContext):
+async def start(
+    message: types.Message,
+    state: FSMContext
+):
 
     await state.clear()
 
@@ -66,23 +79,21 @@ async def start(message: types.Message, state: FSMContext):
         await message.answer(
             "🎉 <b>Xush kelibsiz!</b>\n\n"
             f"📢 Ulangan kanal: <b>{channel}</b>\n\n"
-            "📨 Endi menga post yuborishingiz mumkin.\n"
-            "⏰ Keyin joylash vaqtini so‘rayman.\n\n"
-            "🚀 Boshlayveramiz!"
+            "📨 Menga post yuboring.\n"
+            "⏰ Keyin vaqtini so‘rayman.\n\n"
+            "🚀 Boshladik!"
         )
 
     else:
 
         await message.answer(
             "👋 <b>Salom!</b> 🤖\n\n"
-            "📢 Botdan foydalanish uchun avval "
-            "kanalingizni ulang.\n\n"
-            "🔹 <b>1-bosqich:</b> Botni kanalingizga "
-            "administrator qilib qo‘shing.\n\n"
-            "🔹 <b>2-bosqich:</b> Kanal username'ini yuboring.\n\n"
+            "📢 Avval kanalingizni ulang.\n\n"
+            "1️⃣ Botni kanalingizga administrator qiling.\n"
+            "2️⃣ Kanal username'ini yuboring.\n\n"
             "💡 Masalan:\n"
             "<code>@meningkanalim</code>\n\n"
-            "🔐 Keyin sizning ham kanal administratori "
+            "🔐 Men sizning ham administrator "
             "ekanligingizni tekshiraman."
         )
 
@@ -91,17 +102,16 @@ async def start(message: types.Message, state: FSMContext):
         )
 
 
-# =========================================================
-# 📢 KANALNI QABUL QILISH
-# =========================================================
+# =====================================================
+# 📢 KANALNI ULASH
+# =====================================================
 
-@dp.message(SetupState.waiting_channel, F.text)
 async def connect_channel(
     message: types.Message,
     state: FSMContext
 ):
 
-    channel = message.text.strip()
+    channel = (message.text or "").strip()
 
     if not channel.startswith("@"):
 
@@ -115,16 +125,10 @@ async def connect_channel(
 
     try:
 
-        # =================================================
-        # 1️⃣ KANALNI TOPISH
-        # =================================================
-
+        # 📢 Kanalni topish
         chat = await bot.get_chat(channel)
 
-        # =================================================
-        # 2️⃣ FOYDALANUVCHINI TEKSHIRISH
-        # =================================================
-
+        # 👤 USER ADMINMI?
         user_member = await bot.get_chat_member(
             chat.id,
             message.from_user.id
@@ -137,17 +141,13 @@ async def connect_channel(
 
             await message.answer(
                 "🚫 <b>Kanal tasdiqlanmadi!</b>\n\n"
-                "Siz bu kanalning administratori emassiz.\n\n"
+                "👤 Siz bu kanalning administratori emassiz.\n\n"
                 "🔐 Faqat kanal administratori "
-                "kanalni ulashi mumkin.\n\n"
-                "📢 O‘zingiz admin bo‘lgan kanalni yuboring."
+                "kanalni ulashi mumkin."
             )
             return
 
-        # =================================================
-        # 3️⃣ BOTNI TEKSHIRISH
-        # =================================================
-
+        # 🤖 BOT ADMINMI?
         bot_member = await bot.get_chat_member(
             chat.id,
             bot.id
@@ -159,31 +159,26 @@ async def connect_channel(
         ]:
 
             await message.answer(
-                "⚠️ <b>Bot hali kanal administratori emas!</b>\n\n"
-                f"📢 Kanal: <code>{channel}</code>\n\n"
-                "1️⃣ Kanal sozlamalarini oching.\n"
-                "2️⃣ Administrators bo‘limiga kiring.\n"
-                "3️⃣ Botni administrator qilib qo‘shing.\n"
-                "4️⃣ Keyin kanalni qayta yuboring.\n\n"
-                "🔒 Shundan keyin xavfsizlik tekshiruvidan o‘tamiz."
+                "⚠️ <b>Bot kanal administratori emas!</b>\n\n"
+                "📢 Avval botni kanalingizga "
+                "administrator qilib qo‘shing."
             )
             return
 
-        # =================================================
-        # 4️⃣ TASDIQLASHGA TAYYOR
-        # =================================================
-
+        # 🔐 Tasdiqlash uchun vaqtinchalik saqlash
         await state.update_data(
             pending_channel=channel
         )
 
         await message.answer(
-            "🔍 <b>1-bosqich muvaffaqiyatli!</b> ✅\n\n"
+            "🔍 <b>1-BOSQICH MUVAFFAQIYATLI!</b> ✅\n\n"
             f"📢 Kanal: <code>{channel}</code>\n"
             "👤 Siz: <b>Administrator</b> ✅\n"
             "🤖 Bot: <b>Administrator</b> ✅\n\n"
-            "🔐 Endi kanalni ulash uchun:\n\n"
-            "👉 <b>TASDIQLASH</b> deb yuboring."
+            "🔐 <b>2-bosqich:</b>\n"
+            "Kanalni ulash uchun:\n\n"
+            "👉 <b>TASDIQLASH</b>\n\n"
+            "deb yozing."
         )
 
         await state.set_state(
@@ -192,30 +187,26 @@ async def connect_channel(
 
     except Exception as e:
 
-        print(f"CHANNEL ERROR: {e}")
+        print("CHANNEL ERROR:", e)
 
         await message.answer(
-            "❌ <b>Kanalni tekshirishda xatolik!</b>\n\n"
-            "🔎 Quyidagilarni tekshiring:\n"
-            "• Kanal username'i to‘g‘rimi?\n"
-            "• Kanal publicmi?\n"
-            "• Bot kanalga admin qilib qo‘shilganmi?\n\n"
+            "❌ <b>Kanalni tekshirib bo‘lmadi!</b>\n\n"
+            "🔎 Kanal username'ini tekshiring.\n\n"
             "💡 Masalan:\n"
             "<code>@meningkanalim</code>"
         )
 
 
-# =========================================================
-# 🔐 2-BOSQICH TASDIQLASH
-# =========================================================
+# =====================================================
+# 🔐 TASDIQLASH
+# =====================================================
 
-@dp.message(SetupState.waiting_confirmation, F.text)
 async def confirm_channel(
     message: types.Message,
     state: FSMContext
 ):
 
-    text = message.text.lower().strip()
+    text = (message.text or "").strip().lower()
 
     if text not in [
         "tasdiqlash",
@@ -225,7 +216,6 @@ async def confirm_channel(
 
         await message.answer(
             "🔐 <b>Tasdiqlash kerak!</b>\n\n"
-            "Kanalni ulash uchun:\n"
             "👉 <b>TASDIQLASH</b> deb yozing."
         )
         return
@@ -237,7 +227,7 @@ async def confirm_channel(
     if not channel:
 
         await message.answer(
-            "❌ Tasdiqlash ma'lumoti topilmadi.\n\n"
+            "❌ Kanal ma'lumoti topilmadi.\n\n"
             "🔄 /start ni bosib qaytadan boshlang."
         )
 
@@ -248,13 +238,13 @@ async def confirm_channel(
 
         chat = await bot.get_chat(channel)
 
-        # Foydalanuvchini yana bir marta tekshiramiz
+        # 👤 USERNI QAYTA TEKSHIRISH
         user_member = await bot.get_chat_member(
             chat.id,
             message.from_user.id
         )
 
-        # Botni ham yana tekshiramiz
+        # 🤖 BOTNI QAYTA TEKSHIRISH
         bot_member = await bot.get_chat_member(
             chat.id,
             bot.id
@@ -266,8 +256,7 @@ async def confirm_channel(
         ]:
 
             await message.answer(
-                "🚫 <b>Tasdiqlash bekor qilindi!</b>\n\n"
-                "Siz kanal administratori emassiz."
+                "🚫 <b>Siz kanal administratori emassiz!</b>"
             )
             return
 
@@ -277,15 +266,11 @@ async def confirm_channel(
         ]:
 
             await message.answer(
-                "🤖 Bot kanal administratori emas.\n\n"
-                "Botga administrator huquqini bering."
+                "🤖 <b>Bot kanal administratori emas!</b>"
             )
             return
 
-        # =================================================
-        # ✅ KANALNI SAQLASH
-        # =================================================
-
+        # ✅ SAQLASH
         user_channels[
             message.from_user.id
         ] = channel
@@ -293,65 +278,38 @@ async def confirm_channel(
         await state.clear()
 
         await message.answer(
-            "🎉🎉 <b>KANAL MUVAFFAQIYATLI ULANDI!</b> 🎉🎉\n\n"
+            "🎉 <b>KANAL MUVAFFAQIYATLI ULANDI!</b> 🎉\n\n"
             f"📢 Kanal: <b>{channel}</b>\n"
-            "👤 Siz: ✅ Admin\n"
-            "🤖 Bot: ✅ Admin\n"
-            "🔐 Xavfsizlik: ✅ Tasdiqlandi\n\n"
-            "🚀 Endi menga post yuboring!\n\n"
+            "👤 Siz: ✅ Administrator\n"
+            "🤖 Bot: ✅ Administrator\n"
+            "🔐 Tekshiruv: ✅ Muvaffaqiyatli\n\n"
+            "📨 Endi post yuboring!\n\n"
+            "📝 Matn\n"
             "📸 Rasm\n"
             "🎥 Video\n"
-            "📝 Matn\n\n"
-            "⏰ Keyin qachon joylashni so‘rayman."
+            "📄 Hujjat"
         )
 
     except Exception as e:
 
-        print(f"CONFIRM ERROR: {e}")
+        print("CONFIRM ERROR:", e)
 
         await message.answer(
-            "❌ Tasdiqlashda xatolik yuz berdi.\n\n"
+            "❌ <b>Tasdiqlashda xatolik!</b>\n\n"
             "🔄 Qaytadan urinib ko‘ring."
         )
 
 
-# =========================================================
-# 📨 POST QABUL QILISH
-# =========================================================
+# =====================================================
+# 📨 POST SAQLASH
+# =====================================================
 
-@dp.message()
-async def receive_message(
+async def save_post(
     message: types.Message,
     state: FSMContext
 ):
 
-    # Buyruqlarni o'tkazib yuborish
-    if message.text and message.text.startswith("/"):
-        return
-
     user_id = message.from_user.id
-
-    # =====================================================
-    # 🔒 KANAL ULANGANMI?
-    # =====================================================
-
-    if user_id not in user_channels:
-
-        await message.answer(
-            "🔒 <b>Avval kanalni ulang!</b>\n\n"
-            "📢 Kanal username'ini yuboring.\n\n"
-            "💡 Masalan:\n"
-            "<code>@meningkanalim</code>"
-        )
-
-        await state.set_state(
-            SetupState.waiting_channel
-        )
-        return
-
-    # =====================================================
-    # 📨 POSTNI SAQLASH
-    # =====================================================
 
     user_messages[user_id] = message
 
@@ -360,34 +318,31 @@ async def receive_message(
     )
 
     await message.answer(
-        "📨 <b>Post qabul qilindi!</b> ✅\n\n"
+        "📨 <b>POST QABUL QILINDI!</b> ✅\n\n"
         "⏰ Endi qachon kanalga joylay?\n\n"
-        "💡 Misollar:\n\n"
+        "💡 Masalan:\n\n"
         "🌙 <code>ertaga 20:00</code>\n"
-        "📅 <code>25-sentabr 20:00</code>"
+        "📅 <code>18-sentabr 10:00</code>\n\n"
+        "✍️ Vaqtni yozing."
     )
 
 
-# =========================================================
-# ⏰ VAQTNI QABUL QILISH
-# =========================================================
+# =====================================================
+# ⏰ VAQTNI TEKSHIRISH
+# =====================================================
 
-@dp.message(SetupState.waiting_time, F.text)
-async def set_time(
+async def process_time(
     message: types.Message,
     state: FSMContext
 ):
 
-    text = message.text.lower().strip()
+    text = (message.text or "").lower().strip()
 
     now = datetime.now(TZ)
 
     try:
 
-        # =================================================
-        # 🌙 ERTAGA
-        # =================================================
-
+        # 🌙 ERTAGA 20:00
         if text.startswith("ertaga"):
 
             time_text = text.replace(
@@ -407,10 +362,7 @@ async def set_time(
                 microsecond=0
             ) + timedelta(days=1)
 
-        # =================================================
-        # 📅 SANA
-        # =================================================
-
+        # 📅 18-sentabr 10:00
         else:
 
             date_text, time_text = text.split()
@@ -436,8 +388,11 @@ async def set_time(
                 "sentyabr": 9,
                 "oktabr": 10,
                 "noyabr": 11,
-                "dekabr": 12,
+                "dekabr": 12
             }
+
+            if month_name not in months:
+                raise ValueError()
 
             month = months[month_name]
 
@@ -455,21 +410,18 @@ async def set_time(
                 tzinfo=TZ
             )
 
+            # Agar vaqt o'tgan bo'lsa
             if send_time <= now:
 
-                send_time = datetime(
-                    now.year + 1,
-                    month,
-                    day,
-                    hour,
-                    minute,
-                    tzinfo=TZ
+                await message.answer(
+                    "⚠️ <b>Bu vaqt allaqachon o‘tib ketgan.</b>\n\n"
+                    "⏰ Kelajakdagi vaqtni yozing.\n\n"
+                    "Masalan:\n"
+                    "<code>18-sentabr 12:00</code>"
                 )
+                return
 
-        # =================================================
-        # 📦 POSTNI OLISH
-        # =================================================
-
+        # 📦 POST
         user_id = message.from_user.id
 
         original_message = user_messages.get(
@@ -486,22 +438,21 @@ async def set_time(
                 "❌ Post topilmadi.\n\n"
                 "📨 Avval post yuboring."
             )
+
+            await state.clear()
             return
 
         if not channel:
 
             await message.answer(
-                "🔒 Kanal ulanmagan.\n\n"
+                "❌ Kanal ulanmagan.\n\n"
                 "🔄 /start orqali kanalni ulang."
             )
 
             await state.clear()
             return
 
-        # =================================================
-        # ⏰ SCHEDULER
-        # =================================================
-
+        # ⏰ JOB
         scheduler.add_job(
             send_to_channel,
             trigger=DateTrigger(
@@ -510,7 +461,7 @@ async def set_time(
             args=[
                 original_message,
                 channel
-            ],
+            ]
         )
 
         await message.answer(
@@ -518,24 +469,101 @@ async def set_time(
             f"📢 Kanal: <b>{channel}</b>\n"
             f"📅 Sana: <b>{send_time.strftime('%d.%m.%Y')}</b>\n"
             f"⏰ Vaqt: <b>{send_time.strftime('%H:%M')}</b>\n\n"
-            "🚀 Belgilangan vaqtda avtomatik yuboraman."
+            "🚀 Belgilangan vaqtda avtomatik yuboraman!"
         )
 
         await state.clear()
 
-    except Exception:
+    except Exception as e:
+
+        print("TIME ERROR:", e)
 
         await message.answer(
-            "😅 <b>Vaqtni tushunmadim.</b>\n\n"
-            "💡 Shunday yozing:\n\n"
+            "😅 <b>Vaqtni tushunmadim!</b>\n\n"
+            "💡 To‘g‘ri yozing:\n\n"
             "🌙 <code>ertaga 20:00</code>\n"
-            "📅 <code>25-sentabr 20:00</code>"
+            "📅 <code>18-sentabr 10:00</code>"
         )
 
 
-# =========================================================
+# =====================================================
+# 📨 BARCHA XABARLARNI BOSHQARISH
+# =====================================================
+
+@dp.message()
+async def all_messages(
+    message: types.Message,
+    state: FSMContext
+):
+
+    current_state = await state.get_state()
+
+    # =================================================
+    # 🔐 KANAL ULASH
+    # =================================================
+
+    if current_state == SetupState.waiting_channel.state:
+
+        await connect_channel(
+            message,
+            state
+        )
+        return
+
+    # =================================================
+    # 🔐 TASDIQLASH
+    # =================================================
+
+    if current_state == SetupState.waiting_confirmation.state:
+
+        await confirm_channel(
+            message,
+            state
+        )
+        return
+
+    # =================================================
+    # ⏰ VAQT
+    # =================================================
+
+    if current_state == SetupState.waiting_time.state:
+
+        await process_time(
+            message,
+            state
+        )
+        return
+
+    # =================================================
+    # 📨 YANGI POST
+    # =================================================
+
+    user_id = message.from_user.id
+
+    if user_id not in user_channels:
+
+        await message.answer(
+            "🔒 <b>Avval kanalni ulang!</b>\n\n"
+            "📢 Kanal username'ini yuboring.\n\n"
+            "💡 Masalan:\n"
+            "<code>@meningkanalim</code>"
+        )
+
+        await state.set_state(
+            SetupState.waiting_channel
+        )
+
+        return
+
+    await save_post(
+        message,
+        state
+    )
+
+
+# =====================================================
 # 📢 KANALGA YUBORISH
-# =========================================================
+# =====================================================
 
 async def send_to_channel(
     message: types.Message,
@@ -547,7 +575,7 @@ async def send_to_channel(
         await bot.copy_message(
             chat_id=channel,
             from_chat_id=message.chat.id,
-            message_id=message.message_id,
+            message_id=message.message_id
         )
 
         print(
@@ -557,15 +585,15 @@ async def send_to_channel(
     except Exception as e:
 
         print(
-            f"❌ POST YUBORISHDA XATO → {channel}"
+            f"❌ POST YUBORILMADI → {channel}"
         )
 
         print(e)
 
 
-# =========================================================
+# =====================================================
 # 🤖 BOTNI ISHGA TUSHIRISH
-# =========================================================
+# =====================================================
 
 async def main():
 
@@ -578,9 +606,10 @@ async def main():
     await dp.start_polling(bot)
 
 
-# =========================================================
+# =====================================================
 # 🚀 START
-# =========================================================
+# =====================================================
 
 if __name__ == "__main__":
+
     asyncio.run(main())
