@@ -2,10 +2,12 @@ import os
 import asyncio
 import random
 import sqlite3
+import html
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
+from openai import AsyncOpenAI
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -27,6 +29,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi!")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY topilmadi!")
+
+ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+AI_MODEL = "gpt-5.6-luna"
 
 TZ = ZoneInfo("Asia/Tashkent")
 DB_FILE = "manager.db"
@@ -468,6 +478,89 @@ def get_matching_sticker(category):
 
 
     return None
+
+
+# =========================================================
+# AI ASSISTANT
+# =========================================================
+
+async def ask_ai(prompt: str) -> str:
+    response = await ai_client.responses.create(
+        model=AI_MODEL,
+        instructions=(
+            "You are the AI assistant inside Manager BOT. "
+            "Answer clearly and briefly in Uzbek unless the user asks for another language. "
+            "Help with Telegram channel posts, writing, ideas, translation, programming, "
+            "and general safe questions."
+        ),
+        input=prompt,
+    )
+
+    text = (response.output_text or "").strip()
+
+    if not text:
+        return "❌ AI javob qaytarmadi."
+
+    return text
+
+
+@dp.message(Command("ai"))
+async def ai_handler(message: types.Message):
+    prompt = (message.text or "").partition(" ")[2].strip()
+
+    if not prompt:
+        await message.answer(
+            "🤖 <b>AI yordamchi</b>\n\n"
+            "Savolingizni /ai dan keyin yozing.\n\n"
+            "Masalan:\n"
+            "<code>/ai Telegram kanal uchun motivatsion post yoz</code>\n"
+            "<code>/ai Python'da list nima?</code>"
+        )
+        return
+
+    await message.answer("🤖 AI o'ylayapti...")
+
+    try:
+        answer = await ask_ai(prompt)
+        await message.answer(html.escape(answer))
+    except Exception as e:
+        print("OpenAI xatosi:", e)
+        await message.answer(
+            "❌ AI bilan bog'lanishda xatolik yuz berdi. "
+            "Render Logs bo'limini tekshiring."
+        )
+
+
+@dp.message(Command("aipost"))
+async def ai_post_handler(message: types.Message):
+    prompt = (message.text or "").partition(" ")[2].strip()
+
+    if not prompt:
+        await message.answer(
+            "📝 <b>AI Post</b>\n\n"
+            "Qanday post kerakligini yozing.\n\n"
+            "Masalan:\n"
+            "<code>/aipost Bugun dasturlash haqida motivatsion post</code>"
+        )
+        return
+
+    await message.answer("📝 AI post tayyorlayapti...")
+
+    try:
+        answer = await ask_ai(
+            "Telegram kanal uchun tayyor post yoz. "
+            "Ortiqcha izohsiz, faqat post matnini ber. "
+            f"Mavzu: {prompt}"
+        )
+        await message.answer(
+            "✅ <b>AI tayyorlagan post:</b>\n\n" + html.escape(answer)
+        )
+    except Exception as e:
+        print("OpenAI post xatosi:", e)
+        await message.answer(
+            "❌ AI post yaratishda xatolik yuz berdi. "
+            "Render Logs bo'limini tekshiring."
+        )
 
 
 # =========================================================
