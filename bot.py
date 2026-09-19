@@ -485,13 +485,25 @@ def get_matching_sticker(category):
 # =========================================================
 
 async def ask_ai(prompt: str) -> str:
+    # AI ga O‘zbekiston (Toshkent) vaqti bo‘yicha aniq joriy sana-vaqtni beramiz.
+    # Shunda "bugun qaysi kun?", "ertaga qaysi sana?" kabi savollarda
+    # model eski yoki noto‘g‘ri sanani taxmin qilmaydi.
+    now = datetime.now(TZ)
+    current_datetime = now.strftime("%Y-%m-%d %H:%M:%S")
+    current_date = now.strftime("%Y-%m-%d")
+
     response = await ai_client.responses.create(
         model=AI_MODEL,
         instructions=(
             "You are the AI assistant inside Manager BOT. "
             "Answer clearly and briefly in Uzbek unless the user asks for another language. "
             "Help with Telegram channel posts, writing, ideas, translation, programming, "
-            "and general safe questions."
+            "and general safe questions. "
+            f"IMPORTANT: The current date and time in Tashkent, Uzbekistan is "
+            f"{current_datetime} (UTC+05:00), and today's date is {current_date}. "
+            "For questions about today, tomorrow, yesterday, day of week, or current date/time, "
+            "use this provided Tashkent date/time as the source of truth. "
+            "Do not guess or use an older date."
         ),
         input=prompt,
     )
