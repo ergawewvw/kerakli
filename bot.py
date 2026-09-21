@@ -41,6 +41,10 @@ AI_MODEL = "gpt-5.6-luna"
 TZ = ZoneInfo("Asia/Tashkent")
 DB_FILE = "manager.db"
 
+# Render Environment Variables orqali o'rnatiladi.
+# Faqat shu Telegram ID /adminstats komandadan foydalana oladi.
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(
@@ -94,6 +98,13 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (
     send_time TEXT NOT NULL,
     sticker_category TEXT,
     status TEXT DEFAULT 'pending'
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS ai_usage (
+    user_id INTEGER PRIMARY KEY,
+    request_count INTEGER DEFAULT 0
 )
 """)
 
@@ -174,6 +185,16 @@ def get_all_stickers():
         row[0]
         for row in cursor.fetchall()
     ]
+
+
+def record_ai_usage(user_id):
+    cursor.execute("""
+        INSERT INTO ai_usage (user_id, request_count)
+        VALUES (?, 1)
+        ON CONFLICT(user_id)
+        DO UPDATE SET request_count = request_count + 1
+    """, (user_id,))
+    db.commit()
 
 
 # =========================================================
@@ -533,6 +554,7 @@ async def ai_handler(message: types.Message):
     await message.answer("🤖 AI o'ylayapti...")
 
     try:
+        record_ai_usage(message.from_user.id)
         answer = await ask_ai(prompt)
         await message.answer(html.escape(answer))
     except Exception as e:
@@ -559,6 +581,7 @@ async def ai_post_handler(message: types.Message):
     await message.answer("📝 AI post tayyorlayapti...")
 
     try:
+        record_ai_usage(message.from_user.id)
         answer = await ask_ai(
             "Telegram kanal uchun tayyor post yoz. "
             "Ortiqcha izohsiz, faqat post matnini ber. "
@@ -573,6 +596,53 @@ async def ai_post_handler(message: types.Message):
             "❌ AI post yaratishda xatolik yuz berdi. "
             "Render Logs bo'limini tekshiring."
         )
+
+
+# =========================================================
+# ADMIN STATISTICS
+# =========================================================
+
+def is_admin(user_id):
+    return ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID
+
+
+@dp.message(Command("adminstats"))
+async def admin_stats_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Bu komanda faqat bot egasi uchun.")
+        return
+
+    cursor.execute("SELECT COUNT(*) FROM users")
+    users_count = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(DISTINCT channel)
+        FROM users
+        WHERE channel IS NOT NULL AND channel != ''
+    """)
+    channels_count = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM scheduled_posts
+        WHERE status = 'pending'
+    """)
+    pending_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COALESCE(SUM(request_count), 0) FROM ai_usage")
+    ai_requests = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM stickers")
+    stickers_count = cursor.fetchone()[0]
+
+    await message.answer(
+        "📊 <b>Manager BOT statistikasi</b>\n\n"
+        f"👤 Foydalanuvchilar: <b>{users_count}</b> ta\n"
+        f"📢 Ulangan kanallar: <b>{channels_count}</b> ta\n"
+        f"📝 Kutilayotgan postlar: <b>{pending_posts}</b> ta\n"
+        f"🤖 AI so'rovlari: <b>{ai_requests}</b> ta\n"
+        f"🎨 Saqlangan stickerlar: <b>{stickers_count}</b> ta"
+    )
 
 
 # =========================================================
@@ -681,10 +751,6 @@ async def all_messages(
         f"🎨 Sticker kategoriyasi: <code>{category}</code>\n\n"
         "⏰ Qachon yuborilsin?\n\n"
         "Masalan:\n"
-        "<code>18:30</code> — bugun\n"
-        "<code>18.30</code> — bugun\n"
-        "<code>18 30</code> — bugun\n"
-        "<code>18:30 ertaga</code>\n"
         "<code>ertaga 18:30</code>\n"
         "<code>20-09 15:00</code>"
     )
@@ -718,138 +784,123 @@ MONTHS = {
 
 
 def parse_time(text):
-    """Vaqtni bir nechta qulay formatda qabul qiladi.
 
-    Qabul qilinadigan formatlar:
-    18:30              -> bugun 18:30
-    18.30              -> bugun 18:30
-    18 30              -> bugun 18:30
-    ertaga 18:30       -> ertaga 18:30
-    18:30 ertaga       -> ertaga 18:30
-    bugun 18:30        -> bugun 18:30
-    20-09 15:00        -> 20-sentabr 15:00
-    15:00 20-09        -> 20-sentabr 15:00
-    20 sentabr 15:00   -> 20-sentabr 15:00
-    15:00 20 sentabr   -> 20-sentabr 15:00
-    """
     text = text.strip().lower()
-    text = text.replace(",", " ")
+
     now = datetime.now(TZ)
 
-    # Nuqta yoki bo'shliq bilan yozilgan soatni standartlashtiramiz.
-    # Masalan: 18.30 -> 18:30, 18 30 -> 18:30
-    text = text.replace(".", ":")
-    raw_parts = text.split()
 
-    if not raw_parts:
-        return None
+    # -----------------------------------------
+    # ertaga 18:30
+    # -----------------------------------------
 
-    # "18 30" -> "18:30"
-    parts = []
-    i = 0
-    while i < len(raw_parts):
-        if (
-            i + 1 < len(raw_parts)
-            and raw_parts[i].isdigit()
-            and raw_parts[i + 1].isdigit()
-            and 0 <= int(raw_parts[i]) <= 23
-            and 0 <= int(raw_parts[i + 1]) <= 59
-        ):
-            parts.append(f"{raw_parts[i]}:{raw_parts[i + 1]}")
-            i += 2
+    parts = text.split()
+
+    if len(parts) == 2:
+
+        first = parts[0]
+        second = parts[1]
+
+
+        if first in ["bugun", "today"]:
+
+            target_date = now.date()
+
+
+        elif first in ["ertaga", "tomorrow"]:
+
+            target_date = (
+                now + timedelta(days=1)
+            ).date()
+
+
         else:
-            parts.append(raw_parts[i])
-            i += 1
 
-    def parse_clock(value):
-        value = value.strip()
-        if ":" not in value:
-            return None
-        try:
-            hour, minute = map(int, value.split(":", 1))
-            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            # 20-09
+            try:
+
+                day, month = map(
+                    int,
+                    first.replace(".", "-").split("-")
+                )
+
+                year = now.year
+
+                target_date = datetime(
+                    year,
+                    month,
+                    day,
+                    tzinfo=TZ
+                ).date()
+
+
+            except Exception:
+
+                target_date = None
+
+
+        if target_date:
+
+            try:
+
+                hour, minute = map(
+                    int,
+                    second.split(":")
+                )
+
+                return datetime(
+                    target_date.year,
+                    target_date.month,
+                    target_date.day,
+                    hour,
+                    minute,
+                    tzinfo=TZ
+                )
+
+            except Exception:
+
                 return None
-            return hour, minute
-        except (ValueError, TypeError):
-            return None
 
-    def parse_numeric_date(value):
-        try:
-            day, month = map(int, value.replace("/", "-").split("-"))
-            if not (1 <= day <= 31 and 1 <= month <= 12):
+
+    # -----------------------------------------
+    # 20 sentabr 18:30
+    # -----------------------------------------
+
+    if len(parts) == 3:
+
+        day = parts[0]
+        month_name = parts[1]
+        time = parts[2]
+
+
+        if month_name in MONTHS:
+
+            try:
+
+                day = int(day)
+                month = MONTHS[month_name]
+
+                hour, minute = map(
+                    int,
+                    time.split(":")
+                )
+
+                year = now.year
+
+                return datetime(
+                    year,
+                    month,
+                    day,
+                    hour,
+                    minute,
+                    tzinfo=TZ
+                )
+
+            except Exception:
+
                 return None
-            return day, month
-        except (ValueError, TypeError):
-            return None
 
-    def make_datetime(day, month, hour, minute):
-        try:
-            year = now.year
-            target = datetime(year, month, day, hour, minute, tzinfo=TZ)
-            # Agar sana bu yil o'tib ketgan bo'lsa, keyingi yilga o'tkazamiz.
-            if target.date() < now.date() and month < now.month:
-                target = target.replace(year=year + 1)
-            return target
-        except ValueError:
-            return None
 
-    # 1) Faqat vaqt: 18:30 / 18.30 / 18 30 -> bugun
-    if len(parts) == 1:
-        clock = parse_clock(parts[0])
-        if clock:
-            hour, minute = clock
-            return datetime(now.year, now.month, now.day, hour, minute, tzinfo=TZ)
-        return None
-
-    # 2) "vaqt + sana/kun" yoki "sana/kun + vaqt"
-    # Masalan: 18:30 ertaga, ertaga 18:30, 18:30 20-09, 20-09 18:30
-    clock = None
-    date_day = None
-    date_month = None
-    relative = None
-
-    for part in parts:
-        c = parse_clock(part)
-        if c and clock is None:
-            clock = c
-            continue
-
-        if part in ("bugun", "today"):
-            relative = "today"
-            continue
-        if part in ("ertaga", "tomorrow"):
-            relative = "tomorrow"
-            continue
-
-        numeric = parse_numeric_date(part)
-        if numeric:
-            date_day, date_month = numeric
-            continue
-
-    # 3) Oy nomi bilan sana: 20 sentabr 18:30 yoki 18:30 20 sentabr
-    if clock is not None and date_day is None:
-        for i, part in enumerate(parts):
-            if part in MONTHS and i > 0 and parts[i - 1].isdigit():
-                date_day = int(parts[i - 1])
-                date_month = MONTHS[part]
-                break
-
-    if clock is None:
-        return None
-
-    hour, minute = clock
-
-    if relative == "tomorrow":
-        target_date = (now + timedelta(days=1)).date()
-        return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=TZ)
-
-    if relative == "today":
-        return datetime(now.year, now.month, now.day, hour, minute, tzinfo=TZ)
-
-    if date_day is not None and date_month is not None:
-        return make_datetime(date_day, date_month, hour, minute)
-
-    # Agar faqat vaqtga qo'shimcha noma'lum so'z berilgan bo'lsa, qabul qilmaymiz.
     return None
 
 
@@ -872,11 +923,8 @@ async def process_time(
         await message.answer(
             "❌ Vaqt formati noto'g'ri.\n\n"
             "To'g'ri misollar:\n"
-            "• <code>18:30</code> — bugun\n"
-            "• <code>18.30</code> — bugun\n"
-            "• <code>18 30</code> — bugun\n"
-            "• <code>18:30 ertaga</code>\n"
             "• <code>ertaga 18:30</code>\n"
+            "• <code>bugun 21:00</code>\n"
             "• <code>20-09 15:00</code>\n"
             "• <code>20 sentabr 15:00</code>"
         )
