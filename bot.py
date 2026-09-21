@@ -9,7 +9,8 @@ from zoneinfo import ZoneInfo
 from aiohttp import web
 from openai import AsyncOpenAI
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -78,6 +79,17 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
+# Foydalanuvchi nomi va username uchun eski bazani avtomatik yangilaymiz.
+for column_sql in [
+    "ALTER TABLE users ADD COLUMN first_name TEXT",
+    "ALTER TABLE users ADD COLUMN username TEXT",
+]:
+    try:
+        cursor.execute(column_sql)
+    except sqlite3.OperationalError:
+        pass
+
+
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS stickers (
@@ -112,6 +124,28 @@ db.commit()
 
 
 # =========================================================
+# MULTI-CHANNEL DATABASE
+# =========================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS user_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    UNIQUE(user_id, channel)
+)
+""")
+
+# Eski bitta kanal formatini yangi ko'p-kanalli jadvalga bir marta ko'chiramiz.
+cursor.execute("""
+INSERT OR IGNORE INTO user_channels (user_id, channel)
+SELECT user_id, channel FROM users
+WHERE channel IS NOT NULL AND channel != ''
+""")
+db.commit()
+
+
+# =========================================================
 # STATES
 # =========================================================
 
@@ -119,6 +153,8 @@ class SetupState(StatesGroup):
     waiting_channel = State()
     waiting_confirmation = State()
     waiting_time = State()
+    waiting_channel_selection = State()
+    waiting_delete_channel = State()
 
 
 class StickerState(StatesGroup):
@@ -126,32 +162,59 @@ class StickerState(StatesGroup):
     waiting_sticker = State()
 
 
+class EditPostState(StatesGroup):
+    waiting_replacement = State()
+
+
 # =========================================================
 # DATABASE FUNCTIONS
 # =========================================================
 
+def register_user(user):
+    """Foydalanuvchining faqat ism va username'ini saqlaydi."""
+    first_name = user.first_name or ""
+    username = user.username or ""
+
+    cursor.execute("""
+        INSERT INTO users (user_id, first_name, username)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            first_name = excluded.first_name,
+            username = excluded.username
+    """, (user.id, first_name, username))
+    db.commit()
+
+
+def get_user_channels(user_id):
+    cursor.execute("""
+        SELECT id, channel FROM user_channels
+        WHERE user_id = ?
+        ORDER BY id ASC
+    """, (user_id,))
+    return cursor.fetchall()
+
+
 def get_user_channel(user_id):
-    cursor.execute(
-        "SELECT channel FROM users WHERE user_id = ?",
-        (user_id,)
-    )
-
-    result = cursor.fetchone()
-
-    if result:
-        return result[0]
-
-    return None
+    channels = get_user_channels(user_id)
+    return channels[0][1] if channels else None
 
 
 def save_user_channel(user_id, channel):
     cursor.execute("""
-        INSERT OR REPLACE INTO users (user_id, channel)
+        INSERT OR IGNORE INTO user_channels (user_id, channel)
         VALUES (?, ?)
     """, (user_id, channel))
-
+    # Eski ustun ham saqlanadi — eski funksiyalar bilan moslik uchun.
+    cursor.execute("UPDATE users SET channel = ? WHERE user_id = ?", (channel, user_id))
+    if cursor.rowcount == 0:
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, channel) VALUES (?, ?)", (user_id, channel))
     db.commit()
 
+
+def delete_user_channel(user_id, channel_id):
+    cursor.execute("DELETE FROM user_channels WHERE id = ? AND user_id = ?", (channel_id, user_id))
+    db.commit()
+    return cursor.rowcount > 0
 
 def save_sticker(category, file_id):
     cursor.execute("""
@@ -207,32 +270,26 @@ async def start_handler(
     state: FSMContext
 ):
 
+    register_user(message.from_user)
     await state.clear()
 
-    channel = get_user_channel(message.from_user.id)
+    channels = get_user_channels(message.from_user.id)
 
-    if channel:
-
-        await message.answer(
-            "👋 <b>Manager BOT</b>\n\n"
-            f"📢 Kanalingiz: <code>{channel}</code>\n\n"
-            "✅ Kanal ulangan.\n\n"
-            "Endi post yuboring."
-        )
-
+    if channels:
+        lines = ["👋 <b>Manager BOT</b>", "", "📢 <b>Ulangan kanallar:</b>"]
+        for i, (_, ch) in enumerate(channels, 1):
+            lines.append(f"{i}. <code>{html.escape(ch)}</code>")
+        lines += ["", "➕ Yangi kanal qo'shish: /channels", "📅 Rejalashtirilgan postlar: /posts"]
+        await message.answer("\n".join(lines))
         return
-
 
     await message.answer(
         "👋 <b>Manager BOT</b>\n\n"
-        "Avval postingiz chiqadigan kanalni ulang.\n\n"
+        "Avval kanal ulang. Bir nechta kanalni ham ulashingiz mumkin.\n\n"
         "📢 Kanal username'sini yuboring:\n"
         "<code>@kanal_username</code>"
     )
-
-    await state.set_state(
-        SetupState.waiting_channel
-    )
+    await state.set_state(SetupState.waiting_channel)
 
 
 # =========================================================
@@ -373,6 +430,115 @@ async def confirm_channel(
         "Endi post yuboring.\n"
         "Masalan, matn yoki rasm + caption."
     )
+
+
+# =========================================================
+# MULTI-CHANNEL MANAGEMENT
+# =========================================================
+
+
+def channel_manage_keyboard(user_id):
+    rows = []
+    for channel_id, channel in get_user_channels(user_id):
+        rows.append([InlineKeyboardButton(text=f"📢 {channel}", callback_data=f"select_channel:{channel_id}")])
+    rows.append([InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="add_channel")])
+    if get_user_channels(user_id):
+        rows.append([InlineKeyboardButton(text="🗑 Kanal o'chirish", callback_data="delete_channel_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def channel_select_keyboard(user_id):
+    rows = []
+    for channel_id, channel in get_user_channels(user_id):
+        rows.append([InlineKeyboardButton(text=f"📢 {channel}", callback_data=f"select_channel:{channel_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("channels"))
+async def channels_handler(message: types.Message, state: FSMContext):
+    register_user(message.from_user)
+    await state.clear()
+    channels = get_user_channels(message.from_user.id)
+    if not channels:
+        await message.answer("📭 Hali kanal ulanmagan.\n\n➕ Kanal qo'shish uchun <code>@kanal_username</code> yuboring.")
+        await state.set_state(SetupState.waiting_channel)
+        return
+    text = "📢 <b>Mening kanallarim</b>\n\n" + "\n".join(
+        f"{i}. <code>{html.escape(ch)}</code>" for i, (_, ch) in enumerate(channels, 1)
+    )
+    await message.answer(text + "\n\n➕ Yangi kanal qo'shish yoki 🗑 o'chirish uchun tugmalardan foydalaning.", reply_markup=channel_manage_keyboard(message.from_user.id))
+
+
+@dp.callback_query(F.data == "add_channel")
+async def add_channel_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(SetupState.waiting_channel)
+    await callback.message.answer("➕ <b>Yangi kanal qo'shish</b>\n\nKanal username'sini yuboring:\n<code>@kanal_username</code>")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "delete_channel_menu")
+async def delete_channel_menu(callback: types.CallbackQuery, state: FSMContext):
+    channels = get_user_channels(callback.from_user.id)
+    if not channels:
+        await callback.answer("Kanal yo'q", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(text=f"🗑 {ch}", callback_data=f"remove_channel:{cid}")] for cid, ch in channels]
+    rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data="channel_menu")])
+    await callback.message.answer("🗑 <b>Qaysi kanalni o'chiramiz?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("remove_channel:"))
+async def remove_channel_callback(callback: types.CallbackQuery):
+    try:
+        channel_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("❌ Xato", show_alert=True)
+        return
+    cursor.execute("SELECT channel FROM user_channels WHERE id = ? AND user_id = ?", (channel_id, callback.from_user.id))
+    row = cursor.fetchone()
+    if not row:
+        await callback.answer("❌ Kanal topilmadi", show_alert=True)
+        return
+    channel = row[0]
+    cursor.execute("SELECT COUNT(*) FROM scheduled_posts WHERE user_id = ? AND channel = ? AND status = 'pending'", (callback.from_user.id, channel))
+    pending = cursor.fetchone()[0]
+    if pending:
+        await callback.answer(f"❌ Bu kanalda {pending} ta rejalashtirilgan post bor. Avval /posts orqali ularni o'chiring.", show_alert=True)
+        return
+    delete_user_channel(callback.from_user.id, channel_id)
+    await callback.message.answer(f"🗑 <b>{html.escape(channel)}</b> kanali o'chirildi.")
+    await callback.answer("Kanal o'chirildi")
+
+
+@dp.callback_query(F.data == "channel_menu")
+async def channel_menu_callback(callback: types.CallbackQuery):
+    await callback.message.answer("📢 <b>Mening kanallarim</b>", reply_markup=channel_manage_keyboard(callback.from_user.id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("select_channel:"))
+async def select_channel_callback(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        channel_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("❌ Xato", show_alert=True)
+        return
+    cursor.execute("SELECT channel FROM user_channels WHERE id = ? AND user_id = ?", (channel_id, callback.from_user.id))
+    row = cursor.fetchone()
+    if not row:
+        await callback.answer("❌ Kanal topilmadi", show_alert=True)
+        return
+    channel = row[0]
+    data = await state.get_data()
+    if not data.get("post_message_id"):
+        await callback.answer("Kanal tanlandi")
+        return
+    await state.update_data(selected_channel=channel)
+    await state.set_state(SetupState.waiting_time)
+    await callback.message.answer(f"✅ Kanal tanlandi: <code>{html.escape(channel)}</code>\n\n⏰ Qachon yuborilsin?\nMasalan: <code>ertaga 18:30</code>")
+    await callback.answer()
 
 
 # =========================================================
@@ -539,6 +705,7 @@ async def ask_ai(prompt: str) -> str:
 
 @dp.message(Command("ai"))
 async def ai_handler(message: types.Message):
+    register_user(message.from_user)
     prompt = (message.text or "").partition(" ")[2].strip()
 
     if not prompt:
@@ -567,6 +734,7 @@ async def ai_handler(message: types.Message):
 
 @dp.message(Command("aipost"))
 async def ai_post_handler(message: types.Message):
+    register_user(message.from_user)
     prompt = (message.text or "").partition(" ")[2].strip()
 
     if not prompt:
@@ -615,11 +783,7 @@ async def admin_stats_handler(message: types.Message):
     cursor.execute("SELECT COUNT(*) FROM users")
     users_count = cursor.fetchone()[0]
 
-    cursor.execute("""
-        SELECT COUNT(DISTINCT channel)
-        FROM users
-        WHERE channel IS NOT NULL AND channel != ''
-    """)
+    cursor.execute("SELECT COUNT(*) FROM user_channels")
     channels_count = cursor.fetchone()[0]
 
     cursor.execute("""
@@ -646,6 +810,235 @@ async def admin_stats_handler(message: types.Message):
 
 
 # =========================================================
+# USER LIST (ADMIN ONLY)
+# =========================================================
+
+@dp.message(Command("users"))
+async def users_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Bu komanda faqat bot egasi uchun.")
+        return
+
+    cursor.execute("""
+        SELECT first_name, username
+        FROM users
+        ORDER BY user_id ASC
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer("👥 Hozircha botdan foydalanganlar yo'q.")
+        return
+
+    lines = [f"👥 <b>Bot foydalanuvchilari: {len(rows)} ta</b>", ""]
+
+    for index, (first_name, username) in enumerate(rows, 1):
+        name = html.escape(first_name or "Noma'lum")
+        username_text = f"@{html.escape(username)}" if username else "username yo'q"
+        lines.append(f"{index}. 👤 <b>{name}</b> — {username_text}")
+
+    await message.answer("\n".join(lines))
+
+
+# =========================================================
+# SCHEDULED POSTS MANAGEMENT
+# =========================================================
+
+def scheduled_posts_keyboard(post_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ Edit",
+                    callback_data=f"edit_post:{post_id}"
+                ),
+                InlineKeyboardButton(
+                    text="🗑 O'chirish",
+                    callback_data=f"delete_post:{post_id}"
+                )
+            ]
+        ]
+    )
+
+
+def get_pending_post(post_id, user_id):
+    cursor.execute("""
+        SELECT id, from_chat_id, message_id, channel, send_time, sticker_category
+        FROM scheduled_posts
+        WHERE id = ? AND user_id = ? AND status = 'pending'
+    """, (post_id, user_id))
+    return cursor.fetchone()
+
+
+def format_scheduled_post(row):
+    post_id, from_chat_id, message_id, channel, send_time, sticker_category = row
+    try:
+        target = datetime.fromisoformat(send_time).astimezone(TZ)
+        time_text = target.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        time_text = send_time
+
+    return (
+        f"📝 <b>Post #{post_id}</b>\n"
+        f"📢 Kanal: <code>{html.escape(channel)}</code>\n"
+        f"⏰ Vaqt: <code>{time_text}</code>\n"
+        f"🎨 Sticker: <code>{html.escape(sticker_category or 'default')}</code>"
+    )
+
+
+@dp.message(Command("posts"))
+async def scheduled_posts_handler(message: types.Message):
+    register_user(message.from_user)
+    user_id = message.from_user.id
+
+    cursor.execute("""
+        SELECT id, from_chat_id, message_id, channel, send_time, sticker_category
+        FROM scheduled_posts
+        WHERE user_id = ? AND status = 'pending'
+        ORDER BY send_time ASC
+    """, (user_id,))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer(
+            "📭 <b>Rejalashtirilgan postlar yo'q.</b>\n\n"
+            "Yangi post yuborib, vaqt belgilang."
+        )
+        return
+
+    await message.answer(
+        f"📅 <b>Rejalashtirilgan postlar: {len(rows)} ta</b>\n\n"
+        "✏️ Edit — postni almashtirish\n"
+        "🗑 O'chirish — reja va scheduler'dan olib tashlash"
+    )
+
+    for row in rows:
+        await message.answer(
+            format_scheduled_post(row),
+            reply_markup=scheduled_posts_keyboard(row[0])
+        )
+
+
+@dp.callback_query(F.data.startswith("edit_post:"))
+async def edit_post_callback(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        post_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("❌ Noto'g'ri post.", show_alert=True)
+        return
+
+    row = get_pending_post(post_id, callback.from_user.id)
+
+    if not row:
+        await callback.answer("❌ Bu post topilmadi yoki allaqachon yuborilgan.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.update_data(edit_post_id=post_id)
+    await state.set_state(EditPostState.waiting_replacement)
+
+    await callback.message.answer(
+        f"✏️ <b>Post #{post_id} ni tahrirlash</b>\n\n"
+        "Endi yangi variantni yuboring.\n"
+        "Matn, rasm, video yoki boshqa postni yuborishingiz mumkin.\n\n"
+        "❌ Bekor qilish: <code>/cancel</code>"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("delete_post:"))
+async def delete_post_callback(callback: types.CallbackQuery):
+    try:
+        post_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("❌ Noto'g'ri post.", show_alert=True)
+        return
+
+    row = get_pending_post(post_id, callback.from_user.id)
+
+    if not row:
+        await callback.answer("❌ Bu post topilmadi yoki allaqachon yuborilgan.", show_alert=True)
+        return
+
+    try:
+        scheduler.remove_job(f"post_{post_id}")
+    except Exception:
+        pass
+
+    cursor.execute("""
+        UPDATE scheduled_posts
+        SET status = 'cancelled'
+        WHERE id = ? AND user_id = ? AND status = 'pending'
+    """, (post_id, callback.from_user.id))
+    db.commit()
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"🗑 <b>Post #{post_id} o'chirildi.</b>\n\n"
+        "U endi belgilangan vaqtda kanalga yuborilmaydi."
+    )
+    await callback.answer("Post o'chirildi")
+
+
+@dp.message(Command("cancel"))
+async def cancel_handler(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == EditPostState.waiting_replacement.state:
+        await state.clear()
+        await message.answer("❌ Tahrirlash bekor qilindi.")
+        return
+
+
+@dp.message(EditPostState.waiting_replacement)
+async def receive_edit_replacement(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    post_id = data.get("edit_post_id")
+
+    if not post_id:
+        await state.clear()
+        await message.answer("❌ Tahrirlash ma'lumoti topilmadi.")
+        return
+
+    row = get_pending_post(post_id, message.from_user.id)
+
+    if not row:
+        await state.clear()
+        await message.answer("❌ Bu post allaqachon yuborilgan yoki o'chirilgan.")
+        return
+
+    # Yangi yuborilgan xabarni scheduled postning manbasi qilib qo'yamiz.
+    # Shuning uchun matn, rasm, video va boshqa Telegram post turlari bilan ishlaydi.
+    replacement_text = message.text or message.caption or ""
+    new_category = choose_sticker_category(replacement_text)
+
+    cursor.execute("""
+        UPDATE scheduled_posts
+        SET from_chat_id = ?, message_id = ?, sticker_category = ?
+        WHERE id = ? AND user_id = ? AND status = 'pending'
+    """, (
+        message.chat.id,
+        message.message_id,
+        new_category,
+        post_id,
+        message.from_user.id
+    ))
+    db.commit()
+
+    await state.clear()
+
+    updated = get_pending_post(post_id, message.from_user.id)
+    if updated:
+        await message.answer(
+            "✅ <b>Post yangilandi!</b>\n\n" +
+            format_scheduled_post(updated) +
+            "\n\nEski variant o'rniga yangi variant belgilangan vaqtda yuboriladi."
+        )
+    else:
+        await message.answer("✅ Post yangilandi!")
+
+
+# =========================================================
 # SAVE POST
 # =========================================================
 
@@ -655,8 +1048,12 @@ async def all_messages(
     state: FSMContext
 ):
 
+    register_user(message.from_user)
     current_state = await state.get_state()
 
+    # Commandlar o'zining handlerlarida ishlaydi.
+    if message.text and message.text.startswith("/"):
+        return
 
     # -----------------------------------------------------
     # CHANNEL STATE
@@ -714,20 +1111,14 @@ async def all_messages(
     # NORMAL POST
     # -----------------------------------------------------
 
-    channel = get_user_channel(
-        message.from_user.id
-    )
+    channels = get_user_channels(message.from_user.id)
 
-
-    if not channel:
-
+    if not channels:
         await message.answer(
             "❌ Avval kanalni ulang.\n\n"
-            "/start ni bosing."
+            "/channels"
         )
-
         return
-
 
     # Matnni aniqlaymiz
     post_text = message.text or message.caption or ""
@@ -744,21 +1135,26 @@ async def all_messages(
         sticker_category=category
     )
 
+    if len(channels) > 1:
+        await message.answer(
+            "📥 <b>POST QABUL QILINDI</b>\n\n"
+            "📢 Qaysi kanalga yuborilsin? Tanlang:",
+            reply_markup=channel_select_keyboard(message.from_user.id)
+        )
+        return
 
+    channel = channels[0][1]
+    await state.update_data(selected_channel=channel)
     await message.answer(
         "📥 <b>POST QABUL QILINDI</b>\n\n"
-        f"📢 Kanal: <code>{channel}</code>\n"
+        f"📢 Kanal: <code>{html.escape(channel)}</code>\n"
         f"🎨 Sticker kategoriyasi: <code>{category}</code>\n\n"
         "⏰ Qachon yuborilsin?\n\n"
         "Masalan:\n"
         "<code>ertaga 18:30</code>\n"
         "<code>20-09 15:00</code>"
     )
-
-
-    await state.set_state(
-        SetupState.waiting_time
-    )
+    await state.set_state(SetupState.waiting_time)
 
 
 # =========================================================
@@ -946,11 +1342,12 @@ async def process_time(
 
 
     data = await state.get_data()
+    channel = data.get("selected_channel")
 
-
-    channel = get_user_channel(
-        message.from_user.id
-    )
+    if not channel:
+        channels = get_user_channels(message.from_user.id)
+        if len(channels) == 1:
+            channel = channels[0][1]
 
 
     if not channel:
@@ -962,6 +1359,12 @@ async def process_time(
 
         await state.clear()
 
+        return
+
+
+    if not channel:
+        await message.answer("❌ Kanal tanlanmadi. /channels orqali kanalni ulang.")
+        await state.clear()
         return
 
 
@@ -1026,7 +1429,8 @@ async def process_time(
         f"📢 Kanal: <code>{channel}</code>\n"
         f"⏰ Vaqt: <code>{target.strftime('%d.%m.%Y %H:%M')}</code>\n"
         f"🎨 Sticker: <code>{sticker_category}</code>\n\n"
-        "Post belgilangan vaqtda avtomatik yuboriladi."
+        "Post belgilangan vaqtda avtomatik yuboriladi.\n\n"
+        "📅 Rejalashtirilgan postlarni ko'rish: <code>/posts</code>"
     )
 
 
@@ -1143,6 +1547,7 @@ async def add_sticker(
     state: FSMContext
 ):
 
+    register_user(message.from_user)
     await message.answer(
         "🎨 <b>Sticker qo'shish</b>\n\n"
         "Kategoriya nomini yuboring:\n\n"
