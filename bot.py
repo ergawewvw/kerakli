@@ -41,6 +41,10 @@ AI_MODEL = "gpt-5.6-luna"
 TZ = ZoneInfo("Asia/Tashkent")
 DB_FILE = "manager.db"
 
+# Render Environment Variables orqali o'rnatiladi.
+# Faqat shu Telegram ID /adminstats komandadan foydalana oladi.
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(
@@ -94,6 +98,13 @@ CREATE TABLE IF NOT EXISTS scheduled_posts (
     send_time TEXT NOT NULL,
     sticker_category TEXT,
     status TEXT DEFAULT 'pending'
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS ai_usage (
+    user_id INTEGER PRIMARY KEY,
+    request_count INTEGER DEFAULT 0
 )
 """)
 
@@ -174,6 +185,16 @@ def get_all_stickers():
         row[0]
         for row in cursor.fetchall()
     ]
+
+
+def record_ai_usage(user_id):
+    cursor.execute("""
+        INSERT INTO ai_usage (user_id, request_count)
+        VALUES (?, 1)
+        ON CONFLICT(user_id)
+        DO UPDATE SET request_count = request_count + 1
+    """, (user_id,))
+    db.commit()
 
 
 # =========================================================
@@ -533,6 +554,7 @@ async def ai_handler(message: types.Message):
     await message.answer("🤖 AI o'ylayapti...")
 
     try:
+        record_ai_usage(message.from_user.id)
         answer = await ask_ai(prompt)
         await message.answer(html.escape(answer))
     except Exception as e:
@@ -559,6 +581,7 @@ async def ai_post_handler(message: types.Message):
     await message.answer("📝 AI post tayyorlayapti...")
 
     try:
+        record_ai_usage(message.from_user.id)
         answer = await ask_ai(
             "Telegram kanal uchun tayyor post yoz. "
             "Ortiqcha izohsiz, faqat post matnini ber. "
@@ -573,6 +596,53 @@ async def ai_post_handler(message: types.Message):
             "❌ AI post yaratishda xatolik yuz berdi. "
             "Render Logs bo'limini tekshiring."
         )
+
+
+# =========================================================
+# ADMIN STATISTICS
+# =========================================================
+
+def is_admin(user_id):
+    return ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID
+
+
+@dp.message(Command("adminstats"))
+async def admin_stats_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Bu komanda faqat bot egasi uchun.")
+        return
+
+    cursor.execute("SELECT COUNT(*) FROM users")
+    users_count = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(DISTINCT channel)
+        FROM users
+        WHERE channel IS NOT NULL AND channel != ''
+    """)
+    channels_count = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM scheduled_posts
+        WHERE status = 'pending'
+    """)
+    pending_posts = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COALESCE(SUM(request_count), 0) FROM ai_usage")
+    ai_requests = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM stickers")
+    stickers_count = cursor.fetchone()[0]
+
+    await message.answer(
+        "📊 <b>Manager BOT statistikasi</b>\n\n"
+        f"👤 Foydalanuvchilar: <b>{users_count}</b> ta\n"
+        f"📢 Ulangan kanallar: <b>{channels_count}</b> ta\n"
+        f"📝 Kutilayotgan postlar: <b>{pending_posts}</b> ta\n"
+        f"🤖 AI so'rovlari: <b>{ai_requests}</b> ta\n"
+        f"🎨 Saqlangan stickerlar: <b>{stickers_count}</b> ta"
+    )
 
 
 # =========================================================
