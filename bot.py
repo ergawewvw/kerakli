@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from aiohttp import web
 from openai import AsyncOpenAI
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -649,7 +649,7 @@ async def admin_stats_handler(message: types.Message):
 # SAVE POST
 # =========================================================
 
-@dp.message()
+@dp.message(F.text, ~F.text.startswith("/"))
 async def all_messages(
     message: types.Message,
     state: FSMContext
