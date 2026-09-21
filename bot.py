@@ -121,6 +121,16 @@ CREATE TABLE IF NOT EXISTS ai_usage (
 )
 """)
 
+# Kunlik AI limiti: global foydalanuvchilar ko'payganda API xarajatlarini nazorat qilish.
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS ai_daily_usage (
+    user_id INTEGER NOT NULL,
+    usage_date TEXT NOT NULL,
+    request_count INTEGER DEFAULT 0,
+    PRIMARY KEY (user_id, usage_date)
+)
+""")
+
 db.commit()
 
 # Takroriy postlar
@@ -287,13 +297,47 @@ def get_all_stickers():
 
 
 def record_ai_usage(user_id):
+    """AI foydalanishini umumiy va kunlik hisoblaydi.
+    True qaytsa, yangi so'rovga ruxsat berilgan.
+    """
+    today = datetime.now(TZ).date().isoformat()
+    daily_limit = int(os.getenv("AI_DAILY_LIMIT", "20"))
+
+    row = cursor.execute(
+        "SELECT request_count FROM ai_daily_usage WHERE user_id=? AND usage_date=?",
+        (user_id, today)
+    ).fetchone()
+
+    current = row[0] if row else 0
+    if current >= daily_limit:
+        return False
+
+    cursor.execute("""
+        INSERT INTO ai_daily_usage (user_id, usage_date, request_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, usage_date)
+        DO UPDATE SET request_count = request_count + 1
+    """, (user_id, today))
+
     cursor.execute("""
         INSERT INTO ai_usage (user_id, request_count)
         VALUES (?, 1)
         ON CONFLICT(user_id)
         DO UPDATE SET request_count = request_count + 1
     """, (user_id,))
+
     db.commit()
+    return True
+
+
+def ai_limit_message():
+    limit = int(os.getenv("AI_DAILY_LIMIT", "20"))
+    return (
+        f"⚠️ <b>Kunlik AI limiti tugadi.</b>\n\n"
+        f"Bugungi limit: <b>{limit}</b> ta AI so'rovi.\n"
+        "Ertaga yana foydalanishingiz mumkin."
+    )
+
 
 
 # =========================================================
@@ -315,7 +359,13 @@ async def start_handler(
         lines = ["👋 <b>Manager BOT</b>", "", "📢 <b>Ulangan kanallar:</b>"]
         for i, (_, ch) in enumerate(channels, 1):
             lines.append(f"{i}. <code>{html.escape(ch)}</code>")
-        lines += ["", "➕ Yangi kanal qo'shish: /channels", "📅 Rejalashtirilgan postlar: /posts"]
+        lines += [
+            "",
+            "➕ Yangi kanal qo'shish: /channels",
+            "📅 Rejalashtirilgan postlar: /posts",
+            "🤖 AI: /ai",
+            "📊 Kanal statistikasi: /stats"
+        ]
         await message.answer("\n".join(lines))
         return
 
@@ -757,7 +807,9 @@ async def ai_handler(message: types.Message):
     await message.answer("🤖 AI o'ylayapti...")
 
     try:
-        record_ai_usage(message.from_user.id)
+        if not record_ai_usage(message.from_user.id):
+            await message.answer(ai_limit_message())
+            return
         answer = await ask_ai(prompt)
         await message.answer(html.escape(answer))
     except Exception as e:
@@ -785,7 +837,9 @@ async def ai_post_handler(message: types.Message):
     await message.answer("📝 AI post tayyorlayapti...")
 
     try:
-        record_ai_usage(message.from_user.id)
+        if not record_ai_usage(message.from_user.id):
+            await message.answer(ai_limit_message())
+            return
         answer = await ask_ai(
             "Telegram kanal uchun tayyor post yoz. "
             "Ortiqcha izohsiz, faqat post matnini ber. "
@@ -859,7 +913,9 @@ async def improve_handler(message: types.Message):
         await message.answer("✨ <b>AI postni yaxshilash</b>\n\nMasalan: <code>/improve Bugun yangi kursimiz boshlandi...</code>")
         return
     try:
-        record_ai_usage(message.from_user.id)
+        if not record_ai_usage(message.from_user.id):
+            await message.answer(ai_limit_message())
+            return
         answer = await ask_ai("Quyidagi Telegram postini mazmunini saqlagan holda chiroyli, xatosiz, o'qilishi oson qilib formatla. Sarlavha, mos emoji va kerak bo'lsa 2-4 hashtag qo'sh. Faqat tayyor postni qaytar.\n\n" + prompt)
         await message.answer("✨ <b>Yaxshilangan post:</b>\n\n" + html.escape(answer))
     except Exception as e:
@@ -874,7 +930,9 @@ async def caption_handler(message: types.Message):
         await message.answer("🖼️ <b>AI caption</b>\n\nMasalan: <code>/caption Yangi futbol formasi reklamasi</code>")
         return
     try:
-        record_ai_usage(message.from_user.id)
+        if not record_ai_usage(message.from_user.id):
+            await message.answer(ai_limit_message())
+            return
         answer = await ask_ai("Telegram uchun qisqa va qiziqarli caption yoz. 1-3 emoji va 2-4 hashtag qo'sh. Faqat captionni qaytar. Mavzu: " + prompt)
         await message.answer("🖼️ <b>Caption:</b>\n\n" + html.escape(answer))
     except Exception as e:
@@ -897,13 +955,56 @@ async def history_handler(message: types.Message):
     await message.answer("\n".join(lines))
 
 
+@dp.message(Command("repeat"))
+async def repeat_handler(message: types.Message):
+    register_user(message.from_user)
+    rows = cursor.execute("""
+        SELECT id, channel, interval_type, next_time
+        FROM repeating_posts
+        WHERE user_id = ? AND status = 'active'
+        ORDER BY next_time ASC
+    """, (message.from_user.id,)).fetchall()
+
+    if not rows:
+        await message.answer(
+            "🔁 <b>Takroriy postlar</b>\n\n"
+            "Hozircha faol takroriy post yo'q.\n"
+            "Yaratish uchun /posts → 🔁 Takrorlash tugmasidan foydalaning."
+        )
+        return
+
+    lines = [f"🔁 <b>Faol takroriy postlar: {len(rows)} ta</b>", ""]
+    for rid, channel, interval, next_time in rows:
+        try:
+            t = datetime.fromisoformat(next_time).astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            t = next_time
+        interval_text = "har kuni" if interval == "daily" else "har hafta"
+        lines.append(
+            f"#{rid} — <code>{html.escape(channel)}</code> — "
+            f"{interval_text} — keyingi: <code>{t}</code>"
+        )
+
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("stats"))
+async def stats_alias_handler(message: types.Message):
+    await channel_stats_handler(message)
+
+
 @dp.message(Command("admins"))
 async def admins_handler(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Faqat admin uchun.")
         return
     rows = cursor.execute("SELECT user_id FROM bot_admins ORDER BY user_id").fetchall()
-    text = "👑 <b>Qo'shimcha adminlar</b>\n\n" + ("\n".join(f"• <code>{r[0]}</code>" for r in rows) if rows else "Hozircha yo'q")
+    text = "👑 <b>Bot adminlari</b>\n\n"
+    text += f"👑 Owner: <code>{ADMIN_USER_ID}</code>\n"
+    if rows:
+        text += "\n".join(f"• Admin: <code>{r[0]}</code>" for r in rows)
+    else:
+        text += "Qo'shimcha adminlar: yo'q"
     text += "\n\n➕ Qo'shish: <code>/adminadd USER_ID</code>\n🗑 O'chirish: <code>/admindel USER_ID</code>"
     await message.answer(text)
 
@@ -1066,6 +1167,13 @@ async def admin_stats_handler(message: types.Message):
     cursor.execute("SELECT COALESCE(SUM(request_count), 0) FROM ai_usage")
     ai_requests = cursor.fetchone()[0]
 
+    today = datetime.now(TZ).date().isoformat()
+    cursor.execute(
+        "SELECT COALESCE(SUM(request_count), 0) FROM ai_daily_usage WHERE usage_date=?",
+        (today,)
+    )
+    ai_today = cursor.fetchone()[0]
+
     cursor.execute("SELECT COUNT(*) FROM stickers")
     stickers_count = cursor.fetchone()[0]
 
@@ -1075,6 +1183,7 @@ async def admin_stats_handler(message: types.Message):
         f"📢 Ulangan kanallar: <b>{channels_count}</b> ta\n"
         f"📝 Kutilayotgan postlar: <b>{pending_posts}</b> ta\n"
         f"🤖 AI so'rovlari: <b>{ai_requests}</b> ta\n"
+        f"📅 Bugungi AI: <b>{ai_today}</b> ta\n"
         f"🎨 Saqlangan stickerlar: <b>{stickers_count}</b> ta"
     )
 
@@ -1890,6 +1999,24 @@ async def start_web_server():
     )
 
 
+@dp.message(Command("help"))
+async def help_handler(message: types.Message):
+    await message.answer(
+        "🤖 <b>Manager BOT</b>\n\n"
+        "📢 /channels — kanallar\n"
+        "📝 /posts — rejalashtirilgan postlar\n"
+        "📜 /history — postlar tarixi\n"
+        "🔁 /repeat — takroriy postlar\n"
+        "📊 /stats — kanal statistikasi\n"
+        "🤖 /ai — AI yordamchi\n"
+        "✨ /improve — postni yaxshilash\n"
+        "🖼️ /caption — caption yaratish\n"
+        "📝 /templates — shablonlar\n"
+        "🎨 /addsticker — sticker qo'shish\n"
+        "❌ /cancel — amalni bekor qilish"
+    )
+
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -1915,6 +2042,7 @@ async def main():
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Botni ishga tushirish"),
+        BotCommand(command="help", description="Bot funksiyalari"),
         BotCommand(command="channels", description="Kanallarni boshqarish"),
         BotCommand(command="ai", description="AI yordamchi"),
         BotCommand(command="aipost", description="AI orqali post yaratish"),
@@ -1922,9 +2050,11 @@ async def main():
         BotCommand(command="caption", description="AI caption yaratish"),
         BotCommand(command="posts", description="Rejalashtirilgan postlar"),
         BotCommand(command="history", description="Postlar tarixi"),
+        BotCommand(command="repeat", description="Takroriy postlar"),
         BotCommand(command="templates", description="Post shablonlari"),
         BotCommand(command="template", description="Shablon olish"),
         BotCommand(command="channelstats", description="Kanal statistikasi"),
+        BotCommand(command="stats", description="Kanal statistikasi"),
         BotCommand(command="addsticker", description="Sticker qo'shish"),
         BotCommand(command="cancel", description="Joriy amalni bekor qilish"),
         BotCommand(command="adminstats", description="Bot statistikasi"),
