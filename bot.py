@@ -10,6 +10,7 @@ from aiohttp import web
 from openai import AsyncOpenAI
 
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -126,6 +127,10 @@ class StickerState(StatesGroup):
     waiting_sticker = State()
 
 
+class EditPostState(StatesGroup):
+    waiting_replacement = State()
+
+
 # =========================================================
 # DATABASE FUNCTIONS
 # =========================================================
@@ -217,7 +222,8 @@ async def start_handler(
             "👋 <b>Manager BOT</b>\n\n"
             f"📢 Kanalingiz: <code>{channel}</code>\n\n"
             "✅ Kanal ulangan.\n\n"
-            "Endi post yuboring."
+            "Endi post yuboring.\n\n"
+            "📅 Rejalashtirilgan postlar: <code>/posts</code>"
         )
 
         return
@@ -646,10 +652,207 @@ async def admin_stats_handler(message: types.Message):
 
 
 # =========================================================
+# SCHEDULED POSTS MANAGEMENT
+# =========================================================
+
+def scheduled_posts_keyboard(post_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ Edit",
+                    callback_data=f"edit_post:{post_id}"
+                ),
+                InlineKeyboardButton(
+                    text="🗑 O'chirish",
+                    callback_data=f"delete_post:{post_id}"
+                )
+            ]
+        ]
+    )
+
+
+def get_pending_post(post_id, user_id):
+    cursor.execute("""
+        SELECT id, from_chat_id, message_id, channel, send_time, sticker_category
+        FROM scheduled_posts
+        WHERE id = ? AND user_id = ? AND status = 'pending'
+    """, (post_id, user_id))
+    return cursor.fetchone()
+
+
+def format_scheduled_post(row):
+    post_id, from_chat_id, message_id, channel, send_time, sticker_category = row
+    try:
+        target = datetime.fromisoformat(send_time).astimezone(TZ)
+        time_text = target.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        time_text = send_time
+
+    return (
+        f"📝 <b>Post #{post_id}</b>\n"
+        f"📢 Kanal: <code>{html.escape(channel)}</code>\n"
+        f"⏰ Vaqt: <code>{time_text}</code>\n"
+        f"🎨 Sticker: <code>{html.escape(sticker_category or 'default')}</code>"
+    )
+
+
+@dp.message(Command("posts"))
+async def scheduled_posts_handler(message: types.Message):
+    user_id = message.from_user.id
+
+    cursor.execute("""
+        SELECT id, from_chat_id, message_id, channel, send_time, sticker_category
+        FROM scheduled_posts
+        WHERE user_id = ? AND status = 'pending'
+        ORDER BY send_time ASC
+    """, (user_id,))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer(
+            "📭 <b>Rejalashtirilgan postlar yo'q.</b>\n\n"
+            "Yangi post yuborib, vaqt belgilang."
+        )
+        return
+
+    await message.answer(
+        f"📅 <b>Rejalashtirilgan postlar: {len(rows)} ta</b>\n\n"
+        "✏️ Edit — postni almashtirish\n"
+        "🗑 O'chirish — reja va scheduler'dan olib tashlash"
+    )
+
+    for row in rows:
+        await message.answer(
+            format_scheduled_post(row),
+            reply_markup=scheduled_posts_keyboard(row[0])
+        )
+
+
+@dp.callback_query(F.data.startswith("edit_post:"))
+async def edit_post_callback(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        post_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("❌ Noto'g'ri post.", show_alert=True)
+        return
+
+    row = get_pending_post(post_id, callback.from_user.id)
+
+    if not row:
+        await callback.answer("❌ Bu post topilmadi yoki allaqachon yuborilgan.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.update_data(edit_post_id=post_id)
+    await state.set_state(EditPostState.waiting_replacement)
+
+    await callback.message.answer(
+        f"✏️ <b>Post #{post_id} ni tahrirlash</b>\n\n"
+        "Endi yangi variantni yuboring.\n"
+        "Matn, rasm, video yoki boshqa postni yuborishingiz mumkin.\n\n"
+        "❌ Bekor qilish: <code>/cancel</code>"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("delete_post:"))
+async def delete_post_callback(callback: types.CallbackQuery):
+    try:
+        post_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("❌ Noto'g'ri post.", show_alert=True)
+        return
+
+    row = get_pending_post(post_id, callback.from_user.id)
+
+    if not row:
+        await callback.answer("❌ Bu post topilmadi yoki allaqachon yuborilgan.", show_alert=True)
+        return
+
+    try:
+        scheduler.remove_job(f"post_{post_id}")
+    except Exception:
+        pass
+
+    cursor.execute("""
+        UPDATE scheduled_posts
+        SET status = 'cancelled'
+        WHERE id = ? AND user_id = ? AND status = 'pending'
+    """, (post_id, callback.from_user.id))
+    db.commit()
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"🗑 <b>Post #{post_id} o'chirildi.</b>\n\n"
+        "U endi belgilangan vaqtda kanalga yuborilmaydi."
+    )
+    await callback.answer("Post o'chirildi")
+
+
+@dp.message(Command("cancel"))
+async def cancel_handler(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == EditPostState.waiting_replacement.state:
+        await state.clear()
+        await message.answer("❌ Tahrirlash bekor qilindi.")
+        return
+
+
+@dp.message(EditPostState.waiting_replacement)
+async def receive_edit_replacement(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    post_id = data.get("edit_post_id")
+
+    if not post_id:
+        await state.clear()
+        await message.answer("❌ Tahrirlash ma'lumoti topilmadi.")
+        return
+
+    row = get_pending_post(post_id, message.from_user.id)
+
+    if not row:
+        await state.clear()
+        await message.answer("❌ Bu post allaqachon yuborilgan yoki o'chirilgan.")
+        return
+
+    # Yangi yuborilgan xabarni scheduled postning manbasi qilib qo'yamiz.
+    # Shuning uchun matn, rasm, video va boshqa Telegram post turlari bilan ishlaydi.
+    replacement_text = message.text or message.caption or ""
+    new_category = choose_sticker_category(replacement_text)
+
+    cursor.execute("""
+        UPDATE scheduled_posts
+        SET from_chat_id = ?, message_id = ?, sticker_category = ?
+        WHERE id = ? AND user_id = ? AND status = 'pending'
+    """, (
+        message.chat.id,
+        message.message_id,
+        new_category,
+        post_id,
+        message.from_user.id
+    ))
+    db.commit()
+
+    await state.clear()
+
+    updated = get_pending_post(post_id, message.from_user.id)
+    if updated:
+        await message.answer(
+            "✅ <b>Post yangilandi!</b>\n\n" +
+            format_scheduled_post(updated) +
+            "\n\nEski variant o'rniga yangi variant belgilangan vaqtda yuboriladi."
+        )
+    else:
+        await message.answer("✅ Post yangilandi!")
+
+
+# =========================================================
 # SAVE POST
 # =========================================================
 
-@dp.message(F.text, ~F.text.startswith("/"))
+@dp.message()
 async def all_messages(
     message: types.Message,
     state: FSMContext
@@ -657,6 +860,9 @@ async def all_messages(
 
     current_state = await state.get_state()
 
+    # Commandlar o'zining handlerlarida ishlaydi.
+    if message.text and message.text.startswith("/"):
+        return
 
     # -----------------------------------------------------
     # CHANNEL STATE
@@ -1026,7 +1232,8 @@ async def process_time(
         f"📢 Kanal: <code>{channel}</code>\n"
         f"⏰ Vaqt: <code>{target.strftime('%d.%m.%Y %H:%M')}</code>\n"
         f"🎨 Sticker: <code>{sticker_category}</code>\n\n"
-        "Post belgilangan vaqtda avtomatik yuboriladi."
+        "Post belgilangan vaqtda avtomatik yuboriladi.\n\n"
+        "📅 Rejalashtirilgan postlarni ko'rish: <code>/posts</code>"
     )
 
 
