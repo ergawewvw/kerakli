@@ -79,6 +79,17 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
+# Foydalanuvchi nomi va username uchun eski bazani avtomatik yangilaymiz.
+for column_sql in [
+    "ALTER TABLE users ADD COLUMN first_name TEXT",
+    "ALTER TABLE users ADD COLUMN username TEXT",
+]:
+    try:
+        cursor.execute(column_sql)
+    except sqlite3.OperationalError:
+        pass
+
+
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS stickers (
@@ -135,6 +146,21 @@ class EditPostState(StatesGroup):
 # DATABASE FUNCTIONS
 # =========================================================
 
+def register_user(user):
+    """Foydalanuvchining faqat ism va username'ini saqlaydi."""
+    first_name = user.first_name or ""
+    username = user.username or ""
+
+    cursor.execute("""
+        INSERT INTO users (user_id, first_name, username)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            first_name = excluded.first_name,
+            username = excluded.username
+    """, (user.id, first_name, username))
+    db.commit()
+
+
 def get_user_channel(user_id):
     cursor.execute(
         "SELECT channel FROM users WHERE user_id = ?",
@@ -151,9 +177,16 @@ def get_user_channel(user_id):
 
 def save_user_channel(user_id, channel):
     cursor.execute("""
-        INSERT OR REPLACE INTO users (user_id, channel)
-        VALUES (?, ?)
-    """, (user_id, channel))
+        UPDATE users
+        SET channel = ?
+        WHERE user_id = ?
+    """, (channel, user_id))
+
+    if cursor.rowcount == 0:
+        cursor.execute("""
+            INSERT INTO users (user_id, channel)
+            VALUES (?, ?)
+        """, (user_id, channel))
 
     db.commit()
 
@@ -212,6 +245,7 @@ async def start_handler(
     state: FSMContext
 ):
 
+    register_user(message.from_user)
     await state.clear()
 
     channel = get_user_channel(message.from_user.id)
@@ -223,7 +257,8 @@ async def start_handler(
             f"📢 Kanalingiz: <code>{channel}</code>\n\n"
             "✅ Kanal ulangan.\n\n"
             "Endi post yuboring.\n\n"
-            "📅 Rejalashtirilgan postlar: <code>/posts</code>"
+            "📅 Rejalashtirilgan postlar: <code>/posts</code>\n"
+            "✏️ Tahrirlash / 🗑 O'chirish: /posts"
         )
 
         return
@@ -545,6 +580,7 @@ async def ask_ai(prompt: str) -> str:
 
 @dp.message(Command("ai"))
 async def ai_handler(message: types.Message):
+    register_user(message.from_user)
     prompt = (message.text or "").partition(" ")[2].strip()
 
     if not prompt:
@@ -573,6 +609,7 @@ async def ai_handler(message: types.Message):
 
 @dp.message(Command("aipost"))
 async def ai_post_handler(message: types.Message):
+    register_user(message.from_user)
     prompt = (message.text or "").partition(" ")[2].strip()
 
     if not prompt:
@@ -652,6 +689,37 @@ async def admin_stats_handler(message: types.Message):
 
 
 # =========================================================
+# USER LIST (ADMIN ONLY)
+# =========================================================
+
+@dp.message(Command("users"))
+async def users_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Bu komanda faqat bot egasi uchun.")
+        return
+
+    cursor.execute("""
+        SELECT first_name, username
+        FROM users
+        ORDER BY user_id ASC
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer("👥 Hozircha botdan foydalanganlar yo'q.")
+        return
+
+    lines = [f"👥 <b>Bot foydalanuvchilari: {len(rows)} ta</b>", ""]
+
+    for index, (first_name, username) in enumerate(rows, 1):
+        name = html.escape(first_name or "Noma'lum")
+        username_text = f"@{html.escape(username)}" if username else "username yo'q"
+        lines.append(f"{index}. 👤 <b>{name}</b> — {username_text}")
+
+    await message.answer("\n".join(lines))
+
+
+# =========================================================
 # SCHEDULED POSTS MANAGEMENT
 # =========================================================
 
@@ -699,6 +767,7 @@ def format_scheduled_post(row):
 
 @dp.message(Command("posts"))
 async def scheduled_posts_handler(message: types.Message):
+    register_user(message.from_user)
     user_id = message.from_user.id
 
     cursor.execute("""
@@ -858,6 +927,7 @@ async def all_messages(
     state: FSMContext
 ):
 
+    register_user(message.from_user)
     current_state = await state.get_state()
 
     # Commandlar o'zining handlerlarida ishlaydi.
@@ -1350,6 +1420,7 @@ async def add_sticker(
     state: FSMContext
 ):
 
+    register_user(message.from_user)
     await message.answer(
         "🎨 <b>Sticker qo'shish</b>\n\n"
         "Kategoriya nomini yuboring:\n\n"
