@@ -10,7 +10,7 @@ from aiohttp import web
 from openai import AsyncOpenAI
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -20,6 +20,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 
 # =========================================================
@@ -122,6 +123,29 @@ CREATE TABLE IF NOT EXISTS ai_usage (
 
 db.commit()
 
+# Takroriy postlar
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS repeating_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    from_chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    interval_type TEXT NOT NULL,
+    next_time TEXT NOT NULL,
+    sticker_category TEXT,
+    status TEXT DEFAULT 'active'
+)
+""")
+
+# Qo'shimcha adminlar
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bot_admins (
+    user_id INTEGER PRIMARY KEY
+)
+""")
+db.commit()
+
 
 # =========================================================
 # MULTI-CHANNEL DATABASE
@@ -164,6 +188,18 @@ class StickerState(StatesGroup):
 
 class EditPostState(StatesGroup):
     waiting_replacement = State()
+
+
+class PreviewState(StatesGroup):
+    waiting_confirmation = State()
+
+
+class RepeatState(StatesGroup):
+    waiting_interval = State()
+
+
+class AdminState(StatesGroup):
+    waiting_admin_id = State()
 
 
 # =========================================================
@@ -767,11 +803,245 @@ async def ai_post_handler(message: types.Message):
 
 
 # =========================================================
+# EXTRA FEATURES
+# =========================================================
+
+def preview_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="preview_confirm"),
+        InlineKeyboardButton(text="❌ Bekor qilish", callback_data="preview_cancel")
+    ]])
+
+
+def repeat_keyboard(post_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Har kuni", callback_data=f"repeat:daily:{post_id}"),
+         InlineKeyboardButton(text="📆 Har hafta", callback_data=f"repeat:weekly:{post_id}")],
+        [InlineKeyboardButton(text="❌ Bekor", callback_data="repeat_cancel")]
+    ])
+
+
+def template_text(kind):
+    templates = {
+        "reklama": "🔥 <b>REKLAMA</b>\n\nMahsulot/xizmat: [nomi]\n💰 Narx: [narx]\n📩 Murojaat: [aloqa]\n\n#reklama",
+        "yangilik": "📰 <b>YANGILIK</b>\n\n[Yangilik matni]\n\n#yangilik",
+        "elon": "📢 <b>E'LON</b>\n\n[Muhim ma'lumot]\n🕐 Vaqt: [vaqt]\n📍 Manzil: [manzil]",
+        "motivatsiya": "💪 <b>MOTIVATSIYA</b>\n\n[Motivatsion fikr]\n\n#motivatsiya"
+    }
+    return templates.get(kind)
+
+
+@dp.message(Command("templates"))
+async def templates_handler(message: types.Message):
+    await message.answer(
+        "📝 <b>Post shablonlari</b>\n\n"
+        "<code>/template reklama</code>\n"
+        "<code>/template yangilik</code>\n"
+        "<code>/template elon</code>\n"
+        "<code>/template motivatsiya</code>"
+    )
+
+
+@dp.message(Command("template"))
+async def template_handler(message: types.Message):
+    kind = (message.text or "").partition(" ")[2].strip().lower()
+    text = template_text(kind)
+    if not text:
+        await message.answer("❌ Shablon topilmadi. /templates ni bosing.")
+        return
+    await message.answer(text)
+
+
+@dp.message(Command("improve"))
+async def improve_handler(message: types.Message):
+    prompt = (message.text or "").partition(" ")[2].strip()
+    if not prompt:
+        await message.answer("✨ <b>AI postni yaxshilash</b>\n\nMasalan: <code>/improve Bugun yangi kursimiz boshlandi...</code>")
+        return
+    try:
+        record_ai_usage(message.from_user.id)
+        answer = await ask_ai("Quyidagi Telegram postini mazmunini saqlagan holda chiroyli, xatosiz, o'qilishi oson qilib formatla. Sarlavha, mos emoji va kerak bo'lsa 2-4 hashtag qo'sh. Faqat tayyor postni qaytar.\n\n" + prompt)
+        await message.answer("✨ <b>Yaxshilangan post:</b>\n\n" + html.escape(answer))
+    except Exception as e:
+        print("Improve xatosi:", e)
+        await message.answer("❌ AI postni yaxshilay olmadi.")
+
+
+@dp.message(Command("caption"))
+async def caption_handler(message: types.Message):
+    prompt = (message.text or "").partition(" ")[2].strip()
+    if not prompt:
+        await message.answer("🖼️ <b>AI caption</b>\n\nMasalan: <code>/caption Yangi futbol formasi reklamasi</code>")
+        return
+    try:
+        record_ai_usage(message.from_user.id)
+        answer = await ask_ai("Telegram uchun qisqa va qiziqarli caption yoz. 1-3 emoji va 2-4 hashtag qo'sh. Faqat captionni qaytar. Mavzu: " + prompt)
+        await message.answer("🖼️ <b>Caption:</b>\n\n" + html.escape(answer))
+    except Exception as e:
+        print("Caption xatosi:", e)
+        await message.answer("❌ Caption yaratishda xatolik.")
+
+
+@dp.message(Command("history"))
+async def history_handler(message: types.Message):
+    rows = cursor.execute("SELECT id, channel, send_time, status FROM scheduled_posts WHERE user_id = ? AND status != 'pending' ORDER BY id DESC LIMIT 20", (message.from_user.id,)).fetchall()
+    if not rows:
+        await message.answer("📭 Hali postlar tarixi yo'q.")
+        return
+    lines = ["📜 <b>Postlar tarixi</b>", ""]
+    for pid, channel, send_time, status in rows:
+        try: t = datetime.fromisoformat(send_time).astimezone(TZ).strftime("%d.%m %H:%M")
+        except Exception: t = send_time
+        icon = {"sent":"✅", "error":"❌", "cancelled":"🗑", "expired":"⌛"}.get(status, "•")
+        lines.append(f"{icon} #{pid} — <code>{html.escape(channel)}</code> — {t} — {status}")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("admins"))
+async def admins_handler(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Faqat admin uchun.")
+        return
+    rows = cursor.execute("SELECT user_id FROM bot_admins ORDER BY user_id").fetchall()
+    text = "👑 <b>Qo'shimcha adminlar</b>\n\n" + ("\n".join(f"• <code>{r[0]}</code>" for r in rows) if rows else "Hozircha yo'q")
+    text += "\n\n➕ Qo'shish: <code>/adminadd USER_ID</code>\n🗑 O'chirish: <code>/admindel USER_ID</code>"
+    await message.answer(text)
+
+
+@dp.message(Command("adminadd"))
+async def adminadd_handler(message: types.Message):
+    if not (ADMIN_USER_ID == message.from_user.id):
+        await message.answer("❌ Faqat bot egasi yangi admin qo'sha oladi.")
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    try: uid = int(arg)
+    except ValueError:
+        await message.answer("❌ Masalan: <code>/adminadd 123456789</code>")
+        return
+    cursor.execute("INSERT OR IGNORE INTO bot_admins (user_id) VALUES (?)", (uid,)); db.commit()
+    await message.answer(f"✅ <code>{uid}</code> admin qilindi.")
+
+
+@dp.message(Command("admindel"))
+async def admindel_handler(message: types.Message):
+    if ADMIN_USER_ID != message.from_user.id:
+        await message.answer("❌ Faqat bot egasi adminni o'chira oladi.")
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    try: uid = int(arg)
+    except ValueError:
+        await message.answer("❌ Masalan: <code>/admindel 123456789</code>")
+        return
+    cursor.execute("DELETE FROM bot_admins WHERE user_id = ?", (uid,)); db.commit()
+    await message.answer(f"🗑 <code>{uid}</code> adminlikdan olindi.")
+
+
+@dp.message(Command("channelstats"))
+async def channel_stats_handler(message: types.Message):
+    channels = get_user_channels(message.from_user.id)
+    if not channels:
+        await message.answer("❌ Avval kanal ulang.")
+        return
+    lines = ["📊 <b>Kanal statistikasi</b>", ""]
+    for _, channel in channels:
+        try:
+            members = await bot.get_chat_member_count(channel)
+            err = ""
+        except Exception:
+            members = "?"; err = " (bot admin huquqini tekshiring)"
+        pending = cursor.execute("SELECT COUNT(*) FROM scheduled_posts WHERE user_id=? AND channel=? AND status='pending'", (message.from_user.id, channel)).fetchone()[0]
+        sent = cursor.execute("SELECT COUNT(*) FROM scheduled_posts WHERE user_id=? AND channel=? AND status='sent'", (message.from_user.id, channel)).fetchone()[0]
+        lines.append(f"📢 <code>{html.escape(channel)}</code>{err}\n👥 Obunachilar: <b>{members}</b>\n⏰ Kutilayotgan: <b>{pending}</b>\n✅ Yuborilgan: <b>{sent}</b>\n")
+    await message.answer("\n".join(lines))
+
+
+@dp.callback_query(F.data == "preview_cancel")
+async def preview_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("❌ Post rejalashtirish bekor qilindi.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "preview_confirm")
+async def preview_confirm_callback(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("preview_target"):
+        await callback.answer("❌ Preview ma'lumoti topilmadi.", show_alert=True); return
+    target = datetime.fromisoformat(data["preview_target"])
+    cursor.execute("""INSERT INTO scheduled_posts (user_id, from_chat_id, message_id, channel, send_time, sticker_category, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')""", (callback.from_user.id, data["post_chat_id"], data["post_message_id"], data["selected_channel"], target.isoformat(), data.get("sticker_category","default")))
+    db.commit(); post_id = cursor.lastrowid
+    scheduler.add_job(send_scheduled_post, trigger=DateTrigger(run_date=target), args=[post_id], id=f"post_{post_id}", replace_existing=True)
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"✅ <b>Post rejalashtirildi!</b>\n\n📢 <code>{html.escape(data['selected_channel'])}</code>\n⏰ <code>{target.strftime('%d.%m.%Y %H:%M')}</code>\n\n📅 /posts")
+    await callback.answer("Tasdiqlandi")
+
+
+@dp.callback_query(F.data.startswith("repeat_menu:"))
+async def repeat_menu_callback(callback: types.CallbackQuery):
+    post_id = int(callback.data.split(":",1)[1])
+    if not get_pending_post(post_id, callback.from_user.id):
+        await callback.answer("❌ Post topilmadi.", show_alert=True); return
+    await callback.message.answer("🔁 Qanchada bir takrorlansin?", reply_markup=repeat_keyboard(post_id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("repeat:"))
+async def repeat_callback(callback: types.CallbackQuery):
+    try: _, interval, post_id = callback.data.split(":")
+    except ValueError:
+        await callback.answer("❌ Xato", show_alert=True); return
+    row = get_pending_post(int(post_id), callback.from_user.id)
+    if not row:
+        await callback.answer("❌ Post topilmadi.", show_alert=True); return
+    next_time = datetime.now(TZ) + (timedelta(days=1) if interval == "daily" else timedelta(days=7))
+    cursor.execute("INSERT INTO repeating_posts (user_id, from_chat_id, message_id, channel, interval_type, next_time, sticker_category) VALUES (?, ?, ?, ?, ?, ?, ?)", (callback.from_user.id, row[1], row[2], row[3], interval, next_time.isoformat(), row[5]))
+    db.commit(); rid = cursor.lastrowid
+    scheduler.add_job(send_repeating_post, trigger=IntervalTrigger(days=1 if interval == 'daily' else 7, start_date=next_time), args=[rid], id=f"repeat_{rid}", replace_existing=True)
+    await callback.message.answer(f"🔁 Takroriy post yoqildi: <b>{'har kuni' if interval == 'daily' else 'har hafta'}</b>.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "repeat_cancel")
+async def repeat_cancel_callback(callback: types.CallbackQuery):
+    await callback.answer("Bekor qilindi")
+
+
+async def send_repeating_post(repeat_id):
+    row = cursor.execute("SELECT user_id, from_chat_id, message_id, channel, interval_type, sticker_category FROM repeating_posts WHERE id=? AND status='active'", (repeat_id,)).fetchone()
+    if not row: return
+    user_id, from_chat_id, message_id, channel, interval, sticker_category = row
+    try:
+        await bot.copy_message(chat_id=channel, from_chat_id=from_chat_id, message_id=message_id)
+        sticker = get_matching_sticker(sticker_category)
+        if sticker: await bot.send_sticker(chat_id=channel, sticker=sticker)
+        cursor.execute("UPDATE repeating_posts SET next_time=? WHERE id=?", ((datetime.now(TZ)+timedelta(days=1 if interval=='daily' else 7)).isoformat(), repeat_id)); db.commit()
+    except Exception as e:
+        print("Repeat post xatosi:", e)
+        try: await bot.send_message(user_id, f"⚠️ Takroriy post yuborilmadi: <code>{html.escape(str(e)[:300])}</code>")
+        except Exception: pass
+
+
+async def restore_repeating_posts():
+    rows = cursor.execute("SELECT id, next_time, interval_type FROM repeating_posts WHERE status='active'").fetchall()
+    for rid, next_time, interval in rows:
+        try:
+            target = datetime.fromisoformat(next_time)
+            if target <= datetime.now(TZ): target = datetime.now(TZ) + timedelta(minutes=1)
+            scheduler.add_job(send_repeating_post, trigger=IntervalTrigger(days=1 if interval=='daily' else 7, start_date=target), args=[rid], id=f"repeat_{rid}", replace_existing=True)
+        except Exception as e: print("Repeat restore xatosi:", e)
+
+
+# =========================================================
 # ADMIN STATISTICS
 # =========================================================
 
 def is_admin(user_id):
-    return ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID
+    if ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID:
+        return True
+    cursor.execute("SELECT 1 FROM bot_admins WHERE user_id = ?", (user_id,))
+    return cursor.fetchone() is not None
 
 
 @dp.message(Command("adminstats"))
@@ -916,7 +1186,10 @@ async def scheduled_posts_handler(message: types.Message):
     for row in rows:
         await message.answer(
             format_scheduled_post(row),
-            reply_markup=scheduled_posts_keyboard(row[0])
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Edit", callback_data=f"edit_post:{row[0]}"), InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"delete_post:{row[0]}")],
+                [InlineKeyboardButton(text="🔁 Takrorlash", callback_data=f"repeat_menu:{row[0]}")]
+            ])
         )
 
 
@@ -988,6 +1261,11 @@ async def cancel_handler(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer("❌ Tahrirlash bekor qilindi.")
         return
+    if current_state in (PreviewState.waiting_confirmation.state, SetupState.waiting_time.state, StickerState.waiting_category.state, StickerState.waiting_sticker.state):
+        await state.clear()
+        await message.answer("❌ Joriy amal bekor qilindi.")
+        return
+    await message.answer("ℹ️ Hozir bekor qilinadigan amal yo'q.")
 
 
 @dp.message(EditPostState.waiting_replacement)
@@ -1080,6 +1358,11 @@ async def all_messages(
             state
         )
 
+        return
+
+
+    if current_state == PreviewState.waiting_confirmation.state:
+        await message.answer("👀 Avval previewdagi <b>✅ Tasdiqlash</b> yoki <b>❌ Bekor qilish</b> tugmasini bosing.")
         return
 
 
@@ -1180,123 +1463,49 @@ MONTHS = {
 
 
 def parse_time(text):
-
-    text = text.strip().lower()
-
+    text = (text or '').strip().lower().replace(',', ':')
     now = datetime.now(TZ)
-
-
-    # -----------------------------------------
-    # ertaga 18:30
-    # -----------------------------------------
-
     parts = text.split()
-
-    if len(parts) == 2:
-
-        first = parts[0]
-        second = parts[1]
-
-
-        if first in ["bugun", "today"]:
-
-            target_date = now.date()
-
-
-        elif first in ["ertaga", "tomorrow"]:
-
-            target_date = (
-                now + timedelta(days=1)
-            ).date()
-
-
-        else:
-
-            # 20-09
-            try:
-
-                day, month = map(
-                    int,
-                    first.replace(".", "-").split("-")
-                )
-
-                year = now.year
-
-                target_date = datetime(
-                    year,
-                    month,
-                    day,
-                    tzinfo=TZ
-                ).date()
-
-
-            except Exception:
-
-                target_date = None
-
-
-        if target_date:
-
-            try:
-
-                hour, minute = map(
-                    int,
-                    second.split(":")
-                )
-
-                return datetime(
-                    target_date.year,
-                    target_date.month,
-                    target_date.day,
-                    hour,
-                    minute,
-                    tzinfo=TZ
-                )
-
-            except Exception:
-
-                return None
-
-
-    # -----------------------------------------
-    # 20 sentabr 18:30
-    # -----------------------------------------
-
-    if len(parts) == 3:
-
-        day = parts[0]
-        month_name = parts[1]
-        time = parts[2]
-
-
-        if month_name in MONTHS:
-
-            try:
-
-                day = int(day)
-                month = MONTHS[month_name]
-
-                hour, minute = map(
-                    int,
-                    time.split(":")
-                )
-
-                year = now.year
-
-                return datetime(
-                    year,
-                    month,
-                    day,
-                    hour,
-                    minute,
-                    tzinfo=TZ
-                )
-
-            except Exception:
-
-                return None
-
-
+    import re
+    def hm(v):
+        m = re.fullmatch(r'(\d{1,2})(?::|\.|\s)(\d{2})', v.strip())
+        if not m: return None
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h > 23 or mi > 59: return None
+        return h, mi
+    # 18:30 / 18.30 / 18 30
+    m = re.fullmatch(r'(\d{1,2})(?::|\.)(\d{2})', text)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h <= 23 and mi <= 59: return datetime(now.year, now.month, now.day, h, mi, tzinfo=TZ)
+    # 18:30 ertaga / ertaga 18:30 / 18.30 ertaga
+    if len(parts)==2:
+        a,b=parts
+        t=hm(a) or hm(b)
+        dayword = b if t==hm(a) else a
+        if t and dayword in ('bugun','today','ertaga','tomorrow'):
+            d=now.date() + timedelta(days=1 if dayword in ('ertaga','tomorrow') else 0)
+            return datetime(d.year,d.month,d.day,t[0],t[1],tzinfo=TZ)
+        # 20-09 15:00 / 15:00 20-09
+        datepart = a if hm(b) else b
+        timepart = b if hm(b) else a
+        tm=hm(timepart)
+        try:
+            day,month=map(int,re.split(r'[-./]',datepart));
+            if tm and 1<=month<=12 and 1<=day<=31: return datetime(now.year,month,day,tm[0],tm[1],tzinfo=TZ)
+        except Exception: pass
+    # 20 sentabr 15:00 / 15:00 20 sentabr
+    if len(parts)==3:
+        if parts[1] in MONTHS:
+            day,mon,timepart=parts[0],parts[1],parts[2]
+        elif parts[2] in MONTHS:
+            timepart,day,mon=parts[0],parts[1],parts[2]
+        else: return None
+        tm=hm(timepart)
+        try:
+            day=int(day); month=MONTHS[mon]
+            if tm: return datetime(now.year,month,day,tm[0],tm[1],tzinfo=TZ)
+        except Exception: pass
     return None
 
 
@@ -1304,133 +1513,28 @@ def parse_time(text):
 # PROCESS TIME
 # =========================================================
 
-async def process_time(
-    message: types.Message,
-    state: FSMContext
-):
-
-    target = parse_time(
-        message.text
-    )
-
-
+async def process_time(message: types.Message, state: FSMContext):
+    target = parse_time(message.text)
     if not target:
-
-        await message.answer(
-            "❌ Vaqt formati noto'g'ri.\n\n"
-            "To'g'ri misollar:\n"
-            "• <code>ertaga 18:30</code>\n"
-            "• <code>bugun 21:00</code>\n"
-            "• <code>20-09 15:00</code>\n"
-            "• <code>20 sentabr 15:00</code>"
-        )
-
+        await message.answer("❌ Vaqt noto'g'ri. Misollar: <code>18:30</code>, <code>18.30</code>, <code>ertaga 18:30</code>, <code>18:30 ertaga</code>, <code>20-09 15:00</code>")
         return
-
-
-    now = datetime.now(TZ)
-
-
-    if target <= now:
-
-        await message.answer(
-            "❌ Bu vaqt allaqachon o'tib ketgan.\n"
-            "Kelajakdagi vaqtni kiriting."
-        )
-
+    if target <= datetime.now(TZ):
+        await message.answer("❌ Bu vaqt o'tib ketgan. Kelajakdagi vaqtni kiriting.")
         return
-
-
-    data = await state.get_data()
-    channel = data.get("selected_channel")
-
+    data = await state.get_data(); channel = data.get("selected_channel")
     if not channel:
         channels = get_user_channels(message.from_user.id)
-        if len(channels) == 1:
-            channel = channels[0][1]
-
-
+        channel = channels[0][1] if len(channels)==1 else None
     if not channel:
-
-        await message.answer(
-            "❌ Kanal topilmadi.\n"
-            "/start orqali qayta ulang."
-        )
-
-        await state.clear()
-
-        return
-
-
-    if not channel:
-        await message.answer("❌ Kanal tanlanmadi. /channels orqali kanalni ulang.")
-        await state.clear()
-        return
-
-
-    post_chat_id = data.get(
-        "post_chat_id"
-    )
-
-    post_message_id = data.get(
-        "post_message_id"
-    )
-
-    sticker_category = data.get(
-        "sticker_category",
-        "default"
-    )
-
-
-    cursor.execute("""
-        INSERT INTO scheduled_posts
-        (
-            user_id,
-            from_chat_id,
-            message_id,
-            channel,
-            send_time,
-            sticker_category,
-            status
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        message.from_user.id,
-        post_chat_id,
-        post_message_id,
-        channel,
-        target.isoformat(),
-        sticker_category,
-        "pending"
-    ))
-
-    db.commit()
-
-
-    post_id = cursor.lastrowid
-
-
-    scheduler.add_job(
-        send_scheduled_post,
-        trigger=DateTrigger(
-            run_date=target
-        ),
-        args=[post_id],
-        id=f"post_{post_id}",
-        replace_existing=True
-    )
-
-
-    await state.clear()
-
-
+        await message.answer("❌ Kanal tanlanmadi."); await state.clear(); return
+    await state.update_data(preview_target=target.isoformat(), selected_channel=channel)
+    await state.set_state(PreviewState.waiting_confirmation)
     await message.answer(
-        "✅ <b>POST REJAGA QO'YILDI!</b>\n\n"
-        f"📢 Kanal: <code>{channel}</code>\n"
+        "👀 <b>POST PREVIEW</b>\n\n"
+        f"📢 Kanal: <code>{html.escape(channel)}</code>\n"
         f"⏰ Vaqt: <code>{target.strftime('%d.%m.%Y %H:%M')}</code>\n"
-        f"🎨 Sticker: <code>{sticker_category}</code>\n\n"
-        "Post belgilangan vaqtda avtomatik yuboriladi.\n\n"
-        "📅 Rejalashtirilgan postlarni ko'rish: <code>/posts</code>"
+        f"🎨 Sticker: <code>{html.escape(data.get('sticker_category','default'))}</code>\n\n"
+        "Hammasi to'g'rimi?", reply_markup=preview_keyboard()
     )
 
 
@@ -1536,38 +1640,59 @@ async def send_scheduled_post(post_id):
 
         db.commit()
 
+        try:
+            await bot.send_message(
+                user_id,
+                "⚠️ <b>Post yuborilmadi</b>\n\n"
+                f"📢 Kanal: <code>{html.escape(channel)}</code>\n"
+                "Botning kanal admin huquqini va kanal mavjudligini tekshiring."
+            )
+        except Exception:
+            pass
+
 
 # =========================================================
 # ADD STICKER
 # =========================================================
 
+STICKER_CATEGORIES = ["salom", "sport", "kulgi", "sevgi", "bayram", "muhim", "oqish", "it", "muvaffaqiyat", "xafa", "default"]
+
+
+def sticker_category_keyboard():
+    rows=[]
+    for i in range(0, len(STICKER_CATEGORIES), 2):
+        row=[]
+        for category in STICKER_CATEGORIES[i:i+2]:
+            row.append(InlineKeyboardButton(text=f"🎨 {category}", callback_data=f"sticker_cat:{category}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="❌ Bekor", callback_data="sticker_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(Command("addsticker"))
-async def add_sticker(
-    message: types.Message,
-    state: FSMContext
-):
-
+async def add_sticker(message: types.Message, state: FSMContext):
     register_user(message.from_user)
-    await message.answer(
-        "🎨 <b>Sticker qo'shish</b>\n\n"
-        "Kategoriya nomini yuboring:\n\n"
-        "salom\n"
-        "sport\n"
-        "kulgi\n"
-        "sevgi\n"
-        "bayram\n"
-        "muhim\n"
-        "oqish\n"
-        "it\n"
-        "muvaffaqiyat\n"
-        "xafa\n"
-        "default"
-    )
+    await state.clear()
+    await state.set_state(StickerState.waiting_category)
+    await message.answer("🎨 <b>Sticker qo'shish</b>\n\nKategoriya tanlang:", reply_markup=sticker_category_keyboard())
 
 
-    await state.set_state(
-        StickerState.waiting_category
-    )
+@dp.callback_query(F.data.startswith("sticker_cat:"))
+async def sticker_category_callback(callback: types.CallbackQuery, state: FSMContext):
+    category = callback.data.split(":",1)[1]
+    if category not in STICKER_CATEGORIES:
+        await callback.answer("❌ Noto'g'ri kategoriya", show_alert=True); return
+    await state.update_data(sticker_category=category)
+    await state.set_state(StickerState.waiting_sticker)
+    await callback.message.answer(f"✅ Kategoriya: <code>{category}</code>\n\nEndi <b>stickerning o'zini</b> yuboring.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "sticker_cancel")
+async def sticker_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("❌ Sticker qo'shish bekor qilindi.")
+    await callback.answer()
 
 
 async def receive_sticker_category(
@@ -1780,6 +1905,7 @@ async def main():
 
     # Scheduler
     await restore_scheduled_posts()
+    await restore_repeating_posts()
 
     scheduler.start()
 
@@ -1787,6 +1913,24 @@ async def main():
         "⏰ Scheduler ishga tushdi."
     )
 
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Botni ishga tushirish"),
+        BotCommand(command="channels", description="Kanallarni boshqarish"),
+        BotCommand(command="ai", description="AI yordamchi"),
+        BotCommand(command="aipost", description="AI orqali post yaratish"),
+        BotCommand(command="improve", description="Postni AI bilan yaxshilash"),
+        BotCommand(command="caption", description="AI caption yaratish"),
+        BotCommand(command="posts", description="Rejalashtirilgan postlar"),
+        BotCommand(command="history", description="Postlar tarixi"),
+        BotCommand(command="templates", description="Post shablonlari"),
+        BotCommand(command="template", description="Shablon olish"),
+        BotCommand(command="channelstats", description="Kanal statistikasi"),
+        BotCommand(command="addsticker", description="Sticker qo'shish"),
+        BotCommand(command="cancel", description="Joriy amalni bekor qilish"),
+        BotCommand(command="adminstats", description="Bot statistikasi"),
+        BotCommand(command="users", description="Bot foydalanuvchilari"),
+        BotCommand(command="admins", description="Adminlarni boshqarish")
+    ])
 
     # Telegram polling
     await dp.start_polling(
