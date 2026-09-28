@@ -3,6 +3,8 @@ import asyncio
 import random
 import sqlite3
 import html
+import logging
+import sys
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -23,6 +25,15 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 
+# Render stdout/stderr logging; traceback for AI and scheduler errors.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+logger = logging.getLogger("manager_bot")
+
 # =========================================================
 # SETTINGS
 # =========================================================
@@ -38,7 +49,7 @@ if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY topilmadi!")
 
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-AI_MODEL = "gpt-5.6-luna"
+AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 TZ = ZoneInfo("Asia/Tashkent")
 DB_FILE = "manager.db"
@@ -813,7 +824,7 @@ async def ai_handler(message: types.Message):
         answer = await ask_ai(prompt)
         await message.answer(html.escape(answer))
     except Exception as e:
-        print("OpenAI xatosi:", e)
+        logger.exception("OpenAI xatosi")
         await message.answer(
             "❌ AI bilan bog'lanishda xatolik yuz berdi. "
             "Render Logs bo'limini tekshiring."
@@ -849,7 +860,7 @@ async def ai_post_handler(message: types.Message):
             "✅ <b>AI tayyorlagan post:</b>\n\n" + html.escape(answer)
         )
     except Exception as e:
-        print("OpenAI post xatosi:", e)
+        logger.exception("OpenAI post xatosi")
         await message.answer(
             "❌ AI post yaratishda xatolik yuz berdi. "
             "Render Logs bo'limini tekshiring."
@@ -919,7 +930,7 @@ async def improve_handler(message: types.Message):
         answer = await ask_ai("Quyidagi Telegram postini mazmunini saqlagan holda chiroyli, xatosiz, o'qilishi oson qilib formatla. Sarlavha, mos emoji va kerak bo'lsa 2-4 hashtag qo'sh. Faqat tayyor postni qaytar.\n\n" + prompt)
         await message.answer("✨ <b>Yaxshilangan post:</b>\n\n" + html.escape(answer))
     except Exception as e:
-        print("Improve xatosi:", e)
+        logger.exception("Improve xatosi")
         await message.answer("❌ AI postni yaxshilay olmadi.")
 
 
@@ -936,7 +947,7 @@ async def caption_handler(message: types.Message):
         answer = await ask_ai("Telegram uchun qisqa va qiziqarli caption yoz. 1-3 emoji va 2-4 hashtag qo'sh. Faqat captionni qaytar. Mavzu: " + prompt)
         await message.answer("🖼️ <b>Caption:</b>\n\n" + html.escape(answer))
     except Exception as e:
-        print("Caption xatosi:", e)
+        logger.exception("Caption xatosi")
         await message.answer("❌ Caption yaratishda xatolik.")
 
 
@@ -1119,7 +1130,7 @@ async def send_repeating_post(repeat_id):
         if sticker: await bot.send_sticker(chat_id=channel, sticker=sticker)
         cursor.execute("UPDATE repeating_posts SET next_time=? WHERE id=?", ((datetime.now(TZ)+timedelta(days=1 if interval=='daily' else 7)).isoformat(), repeat_id)); db.commit()
     except Exception as e:
-        print("Repeat post xatosi:", e)
+        logger.exception("Repeat post xatosi")
         try: await bot.send_message(user_id, f"⚠️ Takroriy post yuborilmadi: <code>{html.escape(str(e)[:300])}</code>")
         except Exception: pass
 
@@ -1131,7 +1142,7 @@ async def restore_repeating_posts():
             target = datetime.fromisoformat(next_time)
             if target <= datetime.now(TZ): target = datetime.now(TZ) + timedelta(minutes=1)
             scheduler.add_job(send_repeating_post, trigger=IntervalTrigger(days=1 if interval=='daily' else 7, start_date=target), args=[rid], id=f"repeat_{rid}", replace_existing=True)
-        except Exception as e: print("Repeat restore xatosi:", e)
+        except Exception as e: logger.exception("Repeat restore xatosi")
 
 
 # =========================================================
@@ -1708,10 +1719,7 @@ async def send_scheduled_post(post_id):
 
             except Exception as sticker_error:
 
-                print(
-                    "Sticker yuborishda xato:",
-                    sticker_error
-                )
+                logger.exception("Sticker yuborishda xato")
 
 
         cursor.execute("""
@@ -1733,9 +1741,7 @@ async def send_scheduled_post(post_id):
 
     except Exception as e:
 
-        print(
-            f"POST YUBORISHDA XATO: {e}"
-        )
+        logger.exception("POST YUBORISHDA XATO")
 
 
         cursor.execute("""
@@ -1949,9 +1955,7 @@ async def restore_scheduled_posts():
 
         except Exception as e:
 
-            print(
-                f"Scheduler restore xatosi: {e}"
-            )
+            logger.exception("Scheduler restore xatosi")
 
 
 # =========================================================
@@ -2018,12 +2022,21 @@ async def help_handler(message: types.Message):
 
 
 # =========================================================
+# UNHANDLED ERRORS
+# =========================================================
+
+@dp.errors()
+async def log_unhandled_error(event: types.ErrorEvent):
+    logger.error("Unhandled aiogram error: %s", event.exception, exc_info=(type(event.exception), event.exception, event.exception.__traceback__))
+    return True
+
+# =========================================================
 # MAIN
 # =========================================================
 
 async def main():
 
-    print("🤖 Bot ishga tushmoqda...")
+    logger.info("Bot ishga tushmoqda | AI_MODEL=%s", AI_MODEL)
 
 
     # Render port
@@ -2036,9 +2049,7 @@ async def main():
 
     scheduler.start()
 
-    print(
-        "⏰ Scheduler ishga tushdi."
-    )
+    logger.info("Scheduler ishga tushdi")
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Botni ishga tushirish"),
