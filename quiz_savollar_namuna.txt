@@ -1,0 +1,17 @@
+1. Python tilida matn chiqarish uchun qaysi funksiya ishlatiladi?
+A) print()
+B) input()
+C) len()
+D) range()
+
+2. HTML nimaga xizmat qiladi?
+A) Faqat ovoz tahrirlashga
+B) Veb sahifa tuzilishini belgilashga
+C) Protsessorni sovitishga
+D) Faylni arxivlashga
+
+3. Kompyuterning vaqtinchalik tezkor xotirasi qaysi?
+A) SSD
+B) HDD
+C) RAM
+D) ROM
